@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: korotomi-smart-proxy
+    runtime: docker
+    plan: free
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: 7860
+      - key: PROXY_KEY
+        generateValue: true

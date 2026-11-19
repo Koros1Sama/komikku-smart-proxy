@@ -452,6 +452,9 @@ function checkAuth(req, parsedUrl) {
 }
 
 function readJsonBody(req, maxBytes = 1024 * 1024) {
+  if (req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body)) {
+    return Promise.resolve(req.body);
+  }
   return new Promise((resolve, reject) => {
     const chunks = [];
     let len = 0;
@@ -488,7 +491,7 @@ async function runWithConcurrency(items, limit, worker) {
   return results;
 }
 
-const server = http.createServer(async (req, res) => {
+export async function handleRequest(req, res) {
   const parsedUrl = new URL(req.url || '/', `http://localhost:${PORT}`);
   const path = parsedUrl.pathname;
 
@@ -646,6 +649,12 @@ const server = http.createServer(async (req, res) => {
         archive.finalize();
       });
 
+      if (process.env.VERCEL && zipBuffer.length > 4_200_000) {
+        res.writeHead(413, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Bundle exceeds serverless 4.2MB limit; use per-page fallback' }));
+        return;
+      }
+
       res.writeHead(200, {
         'Content-Type': 'application/zip',
         'Content-Length': zipBuffer.length,
@@ -667,7 +676,9 @@ const server = http.createServer(async (req, res) => {
 
   res.writeHead(404, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: 'Not found' }));
-});
+}
+
+const server = http.createServer(handleRequest);
 
 import { pathToFileURL } from 'node:url';
 
