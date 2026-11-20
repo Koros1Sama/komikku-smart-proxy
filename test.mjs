@@ -8,6 +8,7 @@ import {
   compressAndSliceForBundle,
   parseForwardedHeaders,
   ByteLruCache,
+  PerOriginPoliteLimiter,
 } from './server.js';
 import {
   analyzePageContent,
@@ -170,6 +171,22 @@ describe('V2 Content Analysis, Gutter Trimming & Seam-Aware Slicing', () => {
     assert.equal(cache.get('a'), 'valA');
     assert.equal(cache.get('f'), 'valF');
     assert.ok(cache.totalBytes <= 100);
+  });
+
+  it('enforces max concurrency per origin in PerOriginPoliteLimiter', async () => {
+    const limiter = new PerOriginPoliteLimiter(2, 10);
+    let active = 0;
+    let maxSeen = 0;
+    const tasks = Array.from({ length: 6 }, () =>
+      limiter.run('olympustaff.com', async () => {
+        active++;
+        maxSeen = Math.max(maxSeen, active);
+        await new Promise((r) => setTimeout(r, 30));
+        active--;
+      }),
+    );
+    await Promise.all(tasks);
+    assert.ok(maxSeen <= 2, `Expected maxSeen <= 2, got ${maxSeen}`);
   });
 });
 

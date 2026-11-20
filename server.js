@@ -76,12 +76,71 @@ export class ByteLruCache {
 
 const responseCache = new ByteLruCache(CACHE_MAX_BYTES);
 
+/**
+ * Per-origin polite concurrency & pacing limiter (max 3 concurrent + 150ms spacing per host).
+ * Matches real mobile Chrome browser behavior so Render's IP is never flagged by Cloudflare/WAF.
+ */
+export class PerOriginPoliteLimiter {
+  constructor(maxConcurrent = 3, minIntervalMs = 150) {
+    this.maxConcurrent = maxConcurrent;
+    this.minIntervalMs = minIntervalMs;
+    this.hosts = new Map();
+  }
+
+  async run(hostname, task) {
+    const host = String(hostname || 'default').toLowerCase();
+    let state = this.hosts.get(host);
+    if (!state) {
+      state = { active: 0, lastStartMs: 0, queue: [] };
+      this.hosts.set(host, state);
+    }
+
+    await new Promise((resolve) => {
+      const attempt = () => {
+        if (state.active >= this.maxConcurrent) {
+          state.queue.push(attempt);
+          return;
+        }
+        const waitMs = Math.max(0, this.minIntervalMs - (Date.now() - state.lastStartMs));
+        if (waitMs > 0) {
+          state.active++;
+          setTimeout(() => {
+            state.lastStartMs = Date.now();
+            resolve();
+          }, waitMs);
+        } else {
+          state.active++;
+          state.lastStartMs = Date.now();
+          resolve();
+        }
+      };
+      attempt();
+    });
+
+    try {
+      return await task();
+    } finally {
+      state.active = Math.max(0, state.active - 1);
+      if (state.queue.length > 0) {
+        const next = state.queue.shift();
+        next();
+      } else if (state.active === 0) {
+        // Evict idle host state when empty to prevent unbounded map growth
+        this.hosts.delete(host);
+      }
+    }
+  }
+}
+
+const originLimiter = new PerOriginPoliteLimiter(3, 150);
+
 const serverStats = {
   startedAt: Date.now(),
   requestsTotal: 0,
   requestsSuccess: 0,
   requestsFailed: 0,
   cacheHits: 0,
+  rateLimit429Count: 0,
   bytesOriginalTotal: 0,
   bytesCompressedTotal: 0,
 };
@@ -253,6 +312,7 @@ async function safeFetchImageBuffer(targetUrl, { referer, userAgent } = {}, redi
   const reqHeaders = {
     'User-Agent': safeUa,
     Accept: 'image/avif,image/webp,image/png,image/jpeg,image/*;q=0.8,*/*;q=0.5',
+    'Accept-Language': 'ar,en-US;q=0.9,en;q=0.8',
     'Accept-Encoding': 'identity', // keep byte count predictable and avoid double work
   };
   if (safeRef) {
@@ -264,7 +324,7 @@ async function safeFetchImageBuffer(targetUrl, { referer, userAgent } = {}, redi
     }
   }
 
-  return new Promise((resolve, reject) => {
+  return originLimiter.run(parsed.hostname, () => new Promise((resolve, reject) => {
     const options = {
       hostname: parsed.hostname,
       port: parsed.port || (isHttps ? 443 : 80),
@@ -302,6 +362,7 @@ async function safeFetchImageBuffer(targetUrl, { referer, userAgent } = {}, redi
 
       if (status < 200 || status >= 300) {
         res.resume();
+        if (status === 429) serverStats.rateLimit429Count++;
         return reject(new HttpError(status === 403 || status === 429 ? status : 502, `Upstream returned HTTP ${status}`));
       }
 
@@ -341,7 +402,7 @@ async function safeFetchImageBuffer(targetUrl, { referer, userAgent } = {}, redi
     });
     req.on('error', (err) => reject(new HttpError(502, err.message)));
     req.end();
-  });
+  }));
 }
 
 function checkAuth(req, parsedUrl) {
@@ -465,7 +526,7 @@ async function safeFetchUpstreamBridge(
     delete reqHeaders['Content-Length'];
   }
 
-  return new Promise((resolve, reject) => {
+  return originLimiter.run(parsed.hostname, () => new Promise((resolve, reject) => {
     const options = {
       hostname: parsed.hostname,
       port: parsed.port || (isHttps ? 443 : 80),
@@ -479,6 +540,7 @@ async function safeFetchUpstreamBridge(
 
     const req = transport.request(options, (res) => {
       const status = res.statusCode || 502;
+      if (status === 429) serverStats.rateLimit429Count++;
       const rawSetCookie = res.headers['set-cookie'];
       if (Array.isArray(rawSetCookie)) {
         collectedCookies.push(...rawSetCookie);
@@ -552,7 +614,7 @@ async function safeFetchUpstreamBridge(
       req.write(body);
     }
     req.end();
-  });
+  }));
 }
 
 function readJsonBody(req, maxBytes = 1024 * 1024) {
@@ -615,7 +677,7 @@ export async function handleRequest(req, res) {
       JSON.stringify({
         status: 'ok',
         service: 'komikku-smart-proxy',
-        version: '2.2.0',
+        version: '2.3.0',
         engine: hasCjpegli ? 'sharp/libvips + google/jpegli' : 'sharp/libvips',
         features: [
           'avif-auto',
@@ -633,10 +695,17 @@ export async function handleRequest(req, res) {
           'zero-vpn-bridge',
           'lru-ram-cache',
           'keepalive-pool',
+          'polite-anti-ban-limiter',
         ],
         authRequired: Boolean(PROXY_KEY),
         uptimeSec: Math.round((Date.now() - serverStats.startedAt) / 1000),
         memoryMb: Math.round(mem.rss / (1024 * 1024)),
+        cache: {
+          entries: responseCache.map.size,
+          usedMb: Number((responseCache.totalBytes / (1024 * 1024)).toFixed(2)),
+          maxMb: Math.round(CACHE_MAX_BYTES / (1024 * 1024)),
+          hits: serverStats.cacheHits,
+        },
         stats: serverStats,
       }),
     );
@@ -836,7 +905,7 @@ export async function handleRequest(req, res) {
       const failedPages = [];
       const filesToPack = [];
 
-      const processed = await runWithConcurrency(pages, 8, async (p) => {
+      const processed = await runWithConcurrency(pages, 4, async (p) => {
         const idx = Number(p.index);
         if (!Number.isInteger(idx) || idx < 0 || !p.url) {
           return { ok: false, index: p.index, url: p.url, error: 'Invalid page descriptor' };
