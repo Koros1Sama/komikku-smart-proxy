@@ -7,6 +7,7 @@ import {
   compressImageBuffer,
   compressAndSliceForBundle,
   parseForwardedHeaders,
+  ByteLruCache,
 } from './server.js';
 import {
   analyzePageContent,
@@ -153,6 +154,22 @@ describe('V2 Content Analysis, Gutter Trimming & Seam-Aware Slicing', () => {
     assert.equal(clean['Host'], undefined);
     assert.equal(clean['X-Proxy-Key'], undefined);
     assert.equal(clean['CF-Connecting-IP'], undefined);
+  });
+
+  it('evicts oldest entries cleanly in ByteLruCache without exceeding byte cap', () => {
+    const cache = new ByteLruCache(100);
+    cache.set('a', 'valA', 20, 60_000);
+    cache.set('b', 'valB', 20, 60_000);
+    cache.set('c', 'valC', 20, 60_000);
+    cache.set('d', 'valD', 20, 60_000);
+    cache.set('e', 'valE', 20, 60_000);
+    // Access 'a' so 'b' becomes oldest
+    assert.equal(cache.get('a'), 'valA');
+    cache.set('f', 'valF', 20, 60_000);
+    assert.equal(cache.get('b'), null);
+    assert.equal(cache.get('a'), 'valA');
+    assert.equal(cache.get('f'), 'valF');
+    assert.ok(cache.totalBytes <= 100);
   });
 });
 

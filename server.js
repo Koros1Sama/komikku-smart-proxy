@@ -18,18 +18,70 @@ const MAX_DOWNLOAD_BYTES = Number(process.env.MAX_DOWNLOAD_BYTES || 35 * 1024 * 
 const MAX_FETCH_BYTES = Number(process.env.MAX_FETCH_BYTES || 15 * 1024 * 1024); // 15 MB cap for HTML/JSON bridge
 const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 15000);
 const MAX_REDIRECTS = 5;
+const CACHE_MAX_BYTES = Number(process.env.CACHE_MAX_BYTES || 32 * 1024 * 1024); // 32 MB RAM LRU cache
+const COVER_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours for compressed covers
+const HTML_CACHE_TTL_MS = 3 * 60 * 1000; // 3 minutes for catalog/chapter HTML/JSON
 const DEFAULT_UA =
   'Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36';
+
+// Persistent Keep-Alive pools eliminate repeated TLS handshakes on slow origins
+const httpKeepAliveAgent = new http.Agent({ keepAlive: true, maxSockets: 32, maxFreeSockets: 16 });
+const httpsKeepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 32, maxFreeSockets: 16 });
 
 // Prevent libvips from blowing RAM on constrained free hosts
 sharp.concurrency(2);
 sharp.cache({ memory: 64, files: 0, items: 50 });
+
+/**
+ * Bounded byte-size LRU cache with per-entry TTL for covers and /fetch GET pages.
+ */
+export class ByteLruCache {
+  constructor(maxBytes) {
+    this.maxBytes = maxBytes;
+    this.totalBytes = 0;
+    this.map = new Map();
+  }
+
+  get(key) {
+    const entry = this.map.get(key);
+    if (!entry) return null;
+    if (Date.now() > entry.expiresAt) {
+      this.delete(key);
+      return null;
+    }
+    // Refresh recency
+    this.map.delete(key);
+    this.map.set(key, entry);
+    return entry.value;
+  }
+
+  set(key, value, byteLength, ttlMs) {
+    if (byteLength <= 0 || byteLength > this.maxBytes * 0.25) return;
+    if (this.map.has(key)) this.delete(key);
+    while (this.totalBytes + byteLength > this.maxBytes && this.map.size > 0) {
+      const oldestKey = this.map.keys().next().value;
+      this.delete(oldestKey);
+    }
+    this.map.set(key, { value, byteLength, expiresAt: Date.now() + ttlMs });
+    this.totalBytes += byteLength;
+  }
+
+  delete(key) {
+    const existing = this.map.get(key);
+    if (!existing) return;
+    this.totalBytes -= existing.byteLength;
+    this.map.delete(key);
+  }
+}
+
+const responseCache = new ByteLruCache(CACHE_MAX_BYTES);
 
 const serverStats = {
   startedAt: Date.now(),
   requestsTotal: 0,
   requestsSuccess: 0,
   requestsFailed: 0,
+  cacheHits: 0,
   bytesOriginalTotal: 0,
   bytesCompressedTotal: 0,
 };
@@ -220,6 +272,7 @@ async function safeFetchImageBuffer(targetUrl, { referer, userAgent } = {}, redi
       method: 'GET',
       headers: reqHeaders,
       timeout: FETCH_TIMEOUT_MS,
+      agent: isHttps ? httpsKeepAliveAgent : httpKeepAliveAgent,
       // Pin socket to already-validated IP so DNS cannot rebind between check and connect
       lookup: (_host, _opts, cb) => cb(null, resolved.address, resolved.family),
     };
@@ -420,6 +473,7 @@ async function safeFetchUpstreamBridge(
       method: upperMethod,
       headers: reqHeaders,
       timeout: FETCH_TIMEOUT_MS,
+      agent: isHttps ? httpsKeepAliveAgent : httpKeepAliveAgent,
       lookup: (_host, _opts, cb) => cb(null, resolved.address, resolved.family),
     };
 
@@ -561,7 +615,7 @@ export async function handleRequest(req, res) {
       JSON.stringify({
         status: 'ok',
         service: 'komikku-smart-proxy',
-        version: '2.1.0',
+        version: '2.2.0',
         engine: hasCjpegli ? 'sharp/libvips + google/jpegli' : 'sharp/libvips',
         features: [
           'avif-auto',
@@ -577,6 +631,8 @@ export async function handleRequest(req, res) {
           'tall-fallback',
           'chapter-bundle-cbz',
           'zero-vpn-bridge',
+          'lru-ram-cache',
+          'keepalive-pool',
         ],
         authRequired: Boolean(PROXY_KEY),
         uptimeSec: Math.round((Date.now() - serverStats.startedAt) / 1000),
@@ -613,14 +669,33 @@ export async function handleRequest(req, res) {
         parsedUrl.searchParams.get('ua') || req.headers['user-agent'],
       );
       const reqBody = req.method === 'POST' ? await readRawBody(req) : null;
-
-      const upstream = await safeFetchUpstreamBridge(targetUrl, {
-        method: targetMethod,
-        headers: forwardHeaders,
-        body: reqBody,
-      });
-
       const clientAcceptsGzip = String(req.headers['accept-encoding'] || '').includes('gzip');
+      const noCacheReq =
+        String(forwardHeaders['Cache-Control'] || forwardHeaders['cache-control'] || '').includes('no-cache') ||
+        Boolean(forwardHeaders['Cookie'] || forwardHeaders['cookie']);
+      const fetchCacheKey = targetMethod === 'GET' && !noCacheReq ? `fetch:${targetUrl}` : null;
+
+      let upstream = fetchCacheKey ? responseCache.get(fetchCacheKey) : null;
+      let cacheStatus = 'MISS';
+      if (upstream) {
+        cacheStatus = 'HIT';
+        serverStats.cacheHits++;
+      } else {
+        upstream = await safeFetchUpstreamBridge(targetUrl, {
+          method: targetMethod,
+          headers: forwardHeaders,
+          body: reqBody,
+        });
+        if (
+          fetchCacheKey &&
+          upstream.status === 200 &&
+          upstream.setCookies.length === 0 &&
+          upstream.body.length <= 512 * 1024
+        ) {
+          responseCache.set(fetchCacheKey, upstream, upstream.body.length, HTML_CACHE_TTL_MS);
+        }
+      }
+
       const shouldGzip = clientAcceptsGzip && upstream.body.length > 512;
       const outBody = shouldGzip ? zlib.gzipSync(upstream.body) : upstream.body;
 
@@ -631,6 +706,7 @@ export async function handleRequest(req, res) {
         'X-Final-Url': upstream.finalUrl,
         'X-Upstream-Status': String(upstream.status),
         'X-Proxy-Bridge': 'komikku-v2',
+        'X-Cache': cacheStatus,
       };
       if (shouldGzip) {
         resHeaders['Content-Encoding'] = 'gzip';
@@ -666,14 +742,37 @@ export async function handleRequest(req, res) {
     try {
       const referer = parsedUrl.searchParams.get('ref') || req.headers['x-target-referer'];
       const userAgent = parsedUrl.searchParams.get('ua') || req.headers['user-agent'];
+      const wParam = parsedUrl.searchParams.get('w');
+      const qParam = parsedUrl.searchParams.get('q') ?? parsedUrl.searchParams.get('l');
+      const jpgParam = parsedUrl.searchParams.get('jpg');
+      const bwParam = parsedUrl.searchParams.get('bw');
+      const fmtParam = parsedUrl.searchParams.get('fmt');
+      const isCoverRequest = Number(wParam) > 0 && Number(wParam) <= 480;
+      const coverCacheKey = isCoverRequest
+        ? `cover:${targetUrl}|${wParam}|${qParam}|${jpgParam}|${bwParam}|${fmtParam}`
+        : null;
+
+      if (coverCacheKey) {
+        const cached = responseCache.get(coverCacheKey);
+        if (cached) {
+          serverStats.cacheHits++;
+          serverStats.requestsSuccess++;
+          res.writeHead(200, {
+            ...cached.headers,
+            'X-Cache': 'HIT',
+          });
+          res.end(cached.buffer);
+          return;
+        }
+      }
 
       const { buffer: origBuf, magic } = await safeFetchImageBuffer(targetUrl, { referer, userAgent });
       const result = await compressImageBuffer(origBuf, magic, {
-        w: parsedUrl.searchParams.get('w'),
-        q: parsedUrl.searchParams.get('q') ?? parsedUrl.searchParams.get('l'),
-        jpg: parsedUrl.searchParams.get('jpg'),
-        bw: parsedUrl.searchParams.get('bw'),
-        fmt: parsedUrl.searchParams.get('fmt'),
+        w: wParam,
+        q: qParam,
+        jpg: jpgParam,
+        bw: bwParam,
+        fmt: fmtParam,
         trim: parsedUrl.searchParams.get('trim'),
         autobw: parsedUrl.searchParams.get('autobw'),
         adaptive: parsedUrl.searchParams.get('adaptive'),
@@ -693,7 +792,8 @@ export async function handleRequest(req, res) {
         'X-Saved-Bytes': String(saved),
         'X-Proxy-Tier': result.tierLabel,
         'X-Format': result.formatName || result.ext,
-        'Cache-Control': 'private, max-age=86400',
+        'X-Cache': 'MISS',
+        'Cache-Control': isCoverRequest ? 'public, max-age=86400' : 'private, max-age=86400',
       };
       if (result.trimmedPx > 0) {
         headers['X-Trimmed-Height'] = String(result.trimmedPx);
@@ -703,6 +803,10 @@ export async function handleRequest(req, res) {
       }
       if (result.bypassed) {
         headers['X-Proxy-Bypass'] = result.tierLabel;
+      }
+
+      if (coverCacheKey && result.buffer.length <= 256 * 1024) {
+        responseCache.set(coverCacheKey, { buffer: result.buffer, headers }, result.buffer.length, COVER_CACHE_TTL_MS);
       }
 
       res.writeHead(200, headers);
@@ -732,7 +836,7 @@ export async function handleRequest(req, res) {
       const failedPages = [];
       const filesToPack = [];
 
-      const processed = await runWithConcurrency(pages, 5, async (p) => {
+      const processed = await runWithConcurrency(pages, 8, async (p) => {
         const idx = Number(p.index);
         if (!Number.isInteger(idx) || idx < 0 || !p.url) {
           return { ok: false, index: p.index, url: p.url, error: 'Invalid page descriptor' };
