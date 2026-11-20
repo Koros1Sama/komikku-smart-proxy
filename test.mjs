@@ -6,6 +6,7 @@ import {
   detectImageMagic,
   compressImageBuffer,
   compressAndSliceForBundle,
+  parseForwardedHeaders,
 } from './server.js';
 import {
   analyzePageContent,
@@ -133,6 +134,25 @@ describe('V2 Content Analysis, Gutter Trimming & Seam-Aware Slicing', () => {
   it('maps WebP quality to calibrated AVIF quality cleanly', () => {
     assert.ok(mapQualityToAvif(82) >= 48 && mapQualityToAvif(82) <= 55);
     assert.ok(mapQualityToAvif(65) >= 38 && mapQualityToAvif(65) <= 45);
+  });
+
+  it('parses Base64 X-Target-Headers safely and strips hop-by-hop headers', () => {
+    const rawHeaders = {
+      Referer: 'https://mangalek.org/manga/test',
+      Cookie: 'session_id=abc123',
+      'X-Requested-With': 'XMLHttpRequest',
+      Host: 'evil.internal',
+      'X-Proxy-Key': 'leaked',
+      'CF-Connecting-IP': '1.2.3.4',
+    };
+    const b64 = Buffer.from(JSON.stringify(rawHeaders), 'utf8').toString('base64');
+    const clean = parseForwardedHeaders(b64);
+    assert.equal(clean['Referer'], 'https://mangalek.org/manga/test');
+    assert.equal(clean['Cookie'], 'session_id=abc123');
+    assert.equal(clean['X-Requested-With'], 'XMLHttpRequest');
+    assert.equal(clean['Host'], undefined);
+    assert.equal(clean['X-Proxy-Key'], undefined);
+    assert.equal(clean['CF-Connecting-IP'], undefined);
   });
 });
 

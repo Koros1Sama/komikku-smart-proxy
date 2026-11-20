@@ -2,6 +2,7 @@ import http from 'node:http';
 import https from 'node:https';
 import dns from 'node:dns';
 import net from 'node:net';
+import zlib from 'node:zlib';
 import { URL } from 'node:url';
 import sharp from 'sharp';
 import archiver from 'archiver';
@@ -14,8 +15,9 @@ import {
 const PORT = Number(process.env.PORT || 7860);
 const PROXY_KEY = (process.env.PROXY_KEY || '').trim();
 const MAX_DOWNLOAD_BYTES = Number(process.env.MAX_DOWNLOAD_BYTES || 35 * 1024 * 1024); // 35 MB cap
+const MAX_FETCH_BYTES = Number(process.env.MAX_FETCH_BYTES || 15 * 1024 * 1024); // 15 MB cap for HTML/JSON bridge
 const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 15000);
-const MAX_REDIRECTS = 3;
+const MAX_REDIRECTS = 5;
 const DEFAULT_UA =
   'Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36';
 
@@ -296,6 +298,209 @@ function checkAuth(req, parsedUrl) {
   return headerKey === PROXY_KEY || queryKey === PROXY_KEY;
 }
 
+const BLOCKED_FORWARD_HEADERS = new Set([
+  'host',
+  'connection',
+  'content-length',
+  'transfer-encoding',
+  'accept-encoding',
+  'keep-alive',
+  'upgrade',
+  'proxy-authorization',
+  'proxy-connection',
+]);
+
+/**
+ * Decodes Base64-encoded JSON header map from X-Target-Headers, filtering out hop-by-hop headers.
+ */
+export function parseForwardedHeaders(encodedHeader, fallbackRef, fallbackUa) {
+  const clean = {
+    'User-Agent': (fallbackUa || DEFAULT_UA).replace(/[\r\n]/g, ' ').slice(0, 300),
+    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,application/json,*/*;q=0.8',
+    'Accept-Encoding': 'gzip, deflate, br',
+  };
+  const safeRef = sanitizeReferer(fallbackRef);
+  if (safeRef) {
+    clean['Referer'] = safeRef;
+  }
+
+  if (encodedHeader) {
+    try {
+      const jsonStr = Buffer.from(String(encodedHeader), 'base64').toString('utf8');
+      const parsed = JSON.parse(jsonStr);
+      if (parsed && typeof parsed === 'object') {
+        for (const [rawKey, rawVal] of Object.entries(parsed)) {
+          const k = String(rawKey).trim();
+          const lower = k.toLowerCase();
+          if (
+            !k ||
+            BLOCKED_FORWARD_HEADERS.has(lower) ||
+            lower.startsWith('x-proxy-') ||
+            lower.startsWith('x-target-') ||
+            lower.startsWith('x-forwarded-') ||
+            lower.startsWith('cf-')
+          ) {
+            continue;
+          }
+          const val = String(rawVal ?? '').replace(/[\r\n]/g, ' ').slice(0, 4096);
+          if (val) clean[k] = val;
+        }
+      }
+    } catch {
+      // ignore malformed X-Target-Headers and use defaults
+    }
+  }
+  return clean;
+}
+
+function decompressUpstreamBody(buffer, contentEncoding) {
+  const enc = String(contentEncoding || '').toLowerCase().trim();
+  if (!enc || buffer.length === 0) return buffer;
+  try {
+    if (enc.includes('br')) return zlib.brotliDecompressSync(buffer);
+    if (enc.includes('gzip')) return zlib.gunzipSync(buffer);
+    if (enc.includes('deflate')) return zlib.inflateSync(buffer);
+  } catch {
+    return buffer;
+  }
+  return buffer;
+}
+
+function readRawBody(req, maxBytes = 2 * 1024 * 1024) {
+  if (Buffer.isBuffer(req.body)) return Promise.resolve(req.body);
+  if (typeof req.body === 'string') return Promise.resolve(Buffer.from(req.body, 'utf8'));
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let len = 0;
+    req.on('data', (c) => {
+      len += c.length;
+      if (len > maxBytes) {
+        req.destroy();
+        return reject(new HttpError(413, 'Request body too large'));
+      }
+      chunks.push(c);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', (e) => reject(new HttpError(400, e.message)));
+  });
+}
+
+/**
+ * SSRF-hardened Zero-VPN source fetch bridge for HTML/JSON/AJAX catalog & chapter requests.
+ */
+async function safeFetchUpstreamBridge(
+  targetUrl,
+  { method = 'GET', headers = {}, body = null, collectedCookies = [] } = {},
+  redirectDepth = 0,
+) {
+  if (redirectDepth > MAX_REDIRECTS) {
+    throw new HttpError(502, 'Too many redirects');
+  }
+
+  const parsed = validateTargetUrl(targetUrl);
+  const resolved = await resolveAndValidateHost(parsed.hostname);
+  const isHttps = parsed.protocol === 'https:';
+  const transport = isHttps ? https : http;
+  const upperMethod = ['GET', 'POST', 'HEAD', 'OPTIONS'].includes(String(method).toUpperCase())
+    ? String(method).toUpperCase()
+    : 'GET';
+
+  const reqHeaders = { ...headers };
+  if (body && body.length > 0 && upperMethod === 'POST') {
+    reqHeaders['Content-Length'] = String(body.length);
+  } else {
+    delete reqHeaders['Content-Length'];
+  }
+
+  return new Promise((resolve, reject) => {
+    const options = {
+      hostname: parsed.hostname,
+      port: parsed.port || (isHttps ? 443 : 80),
+      path: `${parsed.pathname}${parsed.search}`,
+      method: upperMethod,
+      headers: reqHeaders,
+      timeout: FETCH_TIMEOUT_MS,
+      lookup: (_host, _opts, cb) => cb(null, resolved.address, resolved.family),
+    };
+
+    const req = transport.request(options, (res) => {
+      const status = res.statusCode || 502;
+      const rawSetCookie = res.headers['set-cookie'];
+      if (Array.isArray(rawSetCookie)) {
+        collectedCookies.push(...rawSetCookie);
+      } else if (typeof rawSetCookie === 'string') {
+        collectedCookies.push(rawSetCookie);
+      }
+
+      if ([301, 302, 303, 307, 308].includes(status) && res.headers.location) {
+        res.resume();
+        let nextUrl;
+        try {
+          nextUrl = new URL(res.headers.location, parsed).toString();
+        } catch {
+          return reject(new HttpError(502, 'Invalid redirect location'));
+        }
+        const convertToGet = status === 301 || status === 302 || status === 303;
+        const nextHeaders = { ...reqHeaders };
+        if (convertToGet) {
+          delete nextHeaders['Content-Type'];
+          delete nextHeaders['content-type'];
+          delete nextHeaders['Content-Length'];
+        }
+        safeFetchUpstreamBridge(
+          nextUrl,
+          {
+            method: convertToGet ? 'GET' : upperMethod,
+            headers: nextHeaders,
+            body: convertToGet ? null : body,
+            collectedCookies,
+          },
+          redirectDepth + 1,
+        )
+          .then(resolve)
+          .catch(reject);
+        return;
+      }
+
+      const chunks = [];
+      let totalBytes = 0;
+
+      res.on('data', (chunk) => {
+        totalBytes += chunk.length;
+        if (totalBytes > MAX_FETCH_BYTES) {
+          res.destroy();
+          return reject(new HttpError(413, 'Upstream response exceeded max bridge size'));
+        }
+        chunks.push(chunk);
+      });
+
+      res.on('end', () => {
+        const rawBuf = Buffer.concat(chunks);
+        const decompressed = decompressUpstreamBody(rawBuf, res.headers['content-encoding']);
+        resolve({
+          status,
+          contentType: res.headers['content-type'] || 'text/html; charset=utf-8',
+          body: decompressed,
+          finalUrl: parsed.toString(),
+          setCookies: collectedCookies,
+        });
+      });
+
+      res.on('error', (err) => reject(new HttpError(502, err.message)));
+    });
+
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new HttpError(504, 'Upstream bridge fetch timed out'));
+    });
+    req.on('error', (err) => reject(new HttpError(502, err.message)));
+    if (body && body.length > 0 && upperMethod === 'POST') {
+      req.write(body);
+    }
+    req.end();
+  });
+}
+
 function readJsonBody(req, maxBytes = 1024 * 1024) {
   if (req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body)) {
     return Promise.resolve(req.body);
@@ -341,6 +546,14 @@ export async function handleRequest(req, res) {
   const path = parsedUrl.pathname;
 
   if (req.method === 'GET' && path === '/health') {
+    const wantsAuthVerify =
+      parsedUrl.searchParams.get('verify') === '1' || Boolean(req.headers['x-proxy-key']);
+    if (wantsAuthVerify && !checkAuth(req, parsedUrl)) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Invalid proxy key' }));
+      return;
+    }
+
     const mem = process.memoryUsage();
     const hasCjpegli = Boolean(await detectCjpegliBinary());
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -348,13 +561,14 @@ export async function handleRequest(req, res) {
       JSON.stringify({
         status: 'ok',
         service: 'komikku-smart-proxy',
-        version: '2.0.0',
+        version: '2.1.0',
         engine: hasCjpegli ? 'sharp/libvips + google/jpegli' : 'sharp/libvips',
         features: [
           'avif-auto',
           'webp-sharp-yuv',
           hasCjpegli ? 'google-jpegli' : 'mozjpeg-444',
           'smart-gutter-trim',
+          'oled-bw-noise-snap',
           'auto-bw-detect',
           'hazy-scan-leveling',
           'adaptive-complexity',
@@ -362,6 +576,7 @@ export async function handleRequest(req, res) {
           'referer-forward',
           'tall-fallback',
           'chapter-bundle-cbz',
+          'zero-vpn-bridge',
         ],
         authRequired: Boolean(PROXY_KEY),
         uptimeSec: Math.round((Date.now() - serverStats.startedAt) / 1000),
@@ -375,6 +590,66 @@ export async function handleRequest(req, res) {
   if (!checkAuth(req, parsedUrl)) {
     res.writeHead(401, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'Unauthorized: invalid or missing proxy key' }));
+    return;
+  }
+
+  // Zero-VPN Source Bridge endpoint for browsing blocked manga/manhwa sources without VPN
+  if ((req.method === 'POST' || req.method === 'GET') && path === '/fetch') {
+    serverStats.requestsTotal++;
+    const targetUrl = (req.headers['x-target-url'] || parsedUrl.searchParams.get('url') || '').toString().trim();
+    if (!targetUrl) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Missing target URL (X-Target-Url header or url param)' }));
+      return;
+    }
+
+    try {
+      const targetMethod = (req.headers['x-target-method'] || parsedUrl.searchParams.get('method') || 'GET')
+        .toString()
+        .toUpperCase();
+      const forwardHeaders = parseForwardedHeaders(
+        req.headers['x-target-headers'],
+        parsedUrl.searchParams.get('ref') || req.headers['x-target-referer'],
+        parsedUrl.searchParams.get('ua') || req.headers['user-agent'],
+      );
+      const reqBody = req.method === 'POST' ? await readRawBody(req) : null;
+
+      const upstream = await safeFetchUpstreamBridge(targetUrl, {
+        method: targetMethod,
+        headers: forwardHeaders,
+        body: reqBody,
+      });
+
+      const clientAcceptsGzip = String(req.headers['accept-encoding'] || '').includes('gzip');
+      const shouldGzip = clientAcceptsGzip && upstream.body.length > 512;
+      const outBody = shouldGzip ? zlib.gzipSync(upstream.body) : upstream.body;
+
+      serverStats.requestsSuccess++;
+      const resHeaders = {
+        'Content-Type': upstream.contentType,
+        'Content-Length': outBody.length,
+        'X-Final-Url': upstream.finalUrl,
+        'X-Upstream-Status': String(upstream.status),
+        'X-Proxy-Bridge': 'komikku-v2',
+      };
+      if (shouldGzip) {
+        resHeaders['Content-Encoding'] = 'gzip';
+      }
+      if (upstream.setCookies.length > 0) {
+        resHeaders['X-Upstream-Set-Cookie'] = Buffer.from(
+          JSON.stringify(upstream.setCookies),
+          'utf8',
+        ).toString('base64');
+      }
+
+      res.writeHead(upstream.status, resHeaders);
+      res.end(outBody);
+    } catch (err) {
+      serverStats.requestsFailed++;
+      const status = err instanceof HttpError ? err.status : 502;
+      res.writeHead(status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message || 'Zero-VPN bridge fetch failed' }));
+    }
     return;
   }
 
