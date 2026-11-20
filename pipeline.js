@@ -45,11 +45,48 @@ export function parseBoolFlag(val, defaultVal = false) {
 }
 
 /**
- * Maps WebP/JPEG quality scale (10..95) to calibrated libaom AVIF quality scale (24..78).
- * Calibrated so AVIF matches or beats WebP perceptual fidelity while saving 30-45% more bytes.
+ * Maps WebP/JPEG quality scale (10..95) to calibrated libaom AVIF quality scale (22..72).
+ * Calibrated to SSIMULACRA2 equivalence:
+ *  - q=82 (Light)  -> AVIF 51 (~SSIMULACRA2 82)
+ *  - q=75 (Medium) -> AVIF 47 (~SSIMULACRA2 78)
+ *  - q=65 (High)   -> AVIF 41 (~SSIMULACRA2 73)
+ *  - q=50 (Ultra)  -> AVIF 31 (maximum readable savings)
  */
 export function mapQualityToAvif(webpQuality) {
-  return clampInt(Math.round(webpQuality * 0.72 + 2), 24, 78, 52);
+  return clampInt(Math.round(webpQuality * 0.64 - 1), 22, 72, 42);
+}
+
+/**
+ * Eliminates invisible JPEG/WebP mosquito noise on pure-white speech bubbles/gutters
+ * and pure-black OLED backgrounds in-place.
+ * Checks all channels together so pastel colors (e.g. light blue sky) are never clipped.
+ */
+export function snapNearWhiteAndBlack(rawPixels, channels) {
+  const len = rawPixels.length;
+  if (channels === 1) {
+    for (let i = 0; i < len; i++) {
+      const v = rawPixels[i];
+      if (v >= 248) rawPixels[i] = 255;
+      else if (v <= 7) rawPixels[i] = 0;
+    }
+    return;
+  }
+  if (channels >= 3) {
+    for (let i = 0; i <= len - channels; i += channels) {
+      const r = rawPixels[i];
+      const g = rawPixels[i + 1];
+      const b = rawPixels[i + 2];
+      if (r >= 248 && g >= 248 && b >= 248) {
+        rawPixels[i] = 255;
+        rawPixels[i + 1] = 255;
+        rawPixels[i + 2] = 255;
+      } else if (r <= 7 && g <= 7 && b <= 7) {
+        rawPixels[i] = 0;
+        rawPixels[i + 1] = 0;
+        rawPixels[i + 2] = 0;
+      }
+    }
+  }
 }
 
 /**
@@ -614,6 +651,7 @@ export async function compressImageBufferV2(inputBuffer, magic, opts = {}) {
       prepOpts,
     );
     const { data: rawPixels, info } = await prep.raw().toBuffer({ resolveWithObject: true });
+    snapNearWhiteAndBlack(rawPixels, info.channels);
     const trimmed = trimVerticalGutters(rawPixels, info);
     trimmedPx = trimmed.trimmedPx;
     finalWidth = trimmed.info.width;
@@ -708,6 +746,7 @@ export async function compressAndSliceForBundleV2(inputBuffer, magic, pageIndexS
   );
 
   let { data: rawPixels, info } = await basePipe.raw().toBuffer({ resolveWithObject: true });
+  snapNearWhiteAndBlack(rawPixels, info.channels);
 
   if (enableTrim) {
     const trimmed = trimVerticalGutters(rawPixels, info);

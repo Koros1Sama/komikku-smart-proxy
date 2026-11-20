@@ -131,8 +131,8 @@ describe('V2 Content Analysis, Gutter Trimming & Seam-Aware Slicing', () => {
   });
 
   it('maps WebP quality to calibrated AVIF quality cleanly', () => {
-    assert.ok(mapQualityToAvif(82) >= 58 && mapQualityToAvif(82) <= 64);
-    assert.ok(mapQualityToAvif(65) >= 46 && mapQualityToAvif(65) <= 52);
+    assert.ok(mapQualityToAvif(82) >= 48 && mapQualityToAvif(82) <= 55);
+    assert.ok(mapQualityToAvif(65) >= 38 && mapQualityToAvif(65) <= 45);
   });
 });
 
