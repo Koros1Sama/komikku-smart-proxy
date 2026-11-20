@@ -10,8 +10,8 @@ const execFileAsync = promisify(execFile);
 
 export const WEBP_MAX_DIMENSION = 16383;
 // Komikku/Mihon SubsamplingScaleImageView lacks partial tile seeking for AVIF (#1945),
-// so auto-AVIF is restricted to <= 4000px height (zero scroll lag, maximum savings).
-export const AVIF_LAG_FREE_MAX_HEIGHT = 4000;
+// so auto-AVIF is restricted to <= 4500px height (zero scroll lag, maximum savings).
+export const AVIF_LAG_FREE_MAX_HEIGHT = 4500;
 export const AVIF_HARD_MAX_DIMENSION = 8192;
 const MAX_INPUT_PIXELS = 120_000_000;
 
@@ -682,7 +682,7 @@ export async function compressAndSliceForBundleV2(inputBuffer, magic, pageIndexS
   const enableAutoBw = parseBoolFlag(opts.autobw, true);
   const enableAdaptive = parseBoolFlag(opts.adaptive, true);
   const enableTrim = parseBoolFlag(opts.trim, true);
-  const maxSliceHeight = clampInt(opts.maxSliceHeight, 1500, 12000, 3800);
+  const maxSliceHeight = clampInt(opts.maxSliceHeight, 1500, 4000, 3800);
   const fmtRaw = String(opts.fmt || 'auto').trim().toLowerCase();
   const fmt = ['auto', 'avif', 'webp', 'jpg', 'jpeg'].includes(fmtRaw) ? fmtRaw : 'auto';
 
