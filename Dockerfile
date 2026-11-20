@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY package.json ./
 RUN npm install --omit=dev
 
-COPY server.js ./
+COPY server.js pipeline.js ./
 
 # Hugging Face Spaces expects port 7860 by default; Koyeb/Render override PORT
 ENV PORT=7860

@@ -5,13 +5,17 @@ import net from 'node:net';
 import { URL } from 'node:url';
 import sharp from 'sharp';
 import archiver from 'archiver';
+import {
+  compressImageBufferV2 as compressImageBuffer,
+  compressAndSliceForBundleV2 as compressAndSliceForBundle,
+  detectCjpegliBinary,
+} from './pipeline.js';
 
 const PORT = Number(process.env.PORT || 7860);
 const PROXY_KEY = (process.env.PROXY_KEY || '').trim();
 const MAX_DOWNLOAD_BYTES = Number(process.env.MAX_DOWNLOAD_BYTES || 35 * 1024 * 1024); // 35 MB cap
 const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 15000);
 const MAX_REDIRECTS = 3;
-const WEBP_MAX_DIMENSION = 16383;
 const DEFAULT_UA =
   'Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36';
 
@@ -285,165 +289,6 @@ async function safeFetchImageBuffer(targetUrl, { referer, userAgent } = {}, redi
   });
 }
 
-function clampInt(val, min, max, fallback) {
-  const n = Number(val);
-  if (!Number.isFinite(n)) return fallback;
-  return Math.max(min, Math.min(max, Math.round(n)));
-}
-
-/**
- * Compresses a single image buffer via sharp, enforcing WebP 16383px safety,
- * optional max-width downscale, grayscale, and a No-Gain guard.
- */
-async function compressImageBuffer(inputBuffer, magic, opts) {
-  const maxWidth = clampInt(opts.w, 0, 4096, 0);
-  const quality = clampInt(opts.q ?? opts.l, 10, 95, 65);
-  const wantJpg = opts.jpg === '1' || opts.jpg === 'true' || opts.jpg === true;
-  const wantGrayscale = opts.bw === '1' || opts.bw === 'true' || opts.bw === true;
-
-  // Read metadata safely (limitInputPixels guards against decompression bombs)
-  const meta = await sharp(inputBuffer, { limitInputPixels: 100_000_000 }).metadata();
-  const srcWidth = meta.width || 0;
-  const srcHeight = meta.height || 0;
-  const isAnimated = (meta.pages || 1) > 1;
-
-  // Preserve animated GIF/WebP unless JPEG explicitly forced
-  if (isAnimated && wantJpg) {
-    return {
-      buffer: inputBuffer,
-      ext: magic,
-      contentType: `image/${magic}`,
-      tierLabel: 'passthrough-animated',
-      bypassed: true,
-    };
-  }
-
-  let estWidth = srcWidth;
-  let estHeight = srcHeight;
-  if (maxWidth > 0 && srcWidth > maxWidth && srcHeight > 0) {
-    estHeight = Math.round((srcHeight * maxWidth) / srcWidth);
-    estWidth = maxWidth;
-  }
-
-  // WebP hard limit is 16,383 px in width or height
-  const exceedsWebpLimit = estWidth > WEBP_MAX_DIMENSION || estHeight > WEBP_MAX_DIMENSION;
-  const useJpeg = wantJpg || exceedsWebpLimit;
-
-  let pipeline = sharp(inputBuffer, {
-    animated: isAnimated && !useJpeg,
-    limitInputPixels: 100_000_000,
-  });
-
-  if (maxWidth > 0 && srcWidth > maxWidth) {
-    pipeline = pipeline.resize({ width: maxWidth, withoutEnlargement: true });
-  }
-  if (wantGrayscale) {
-    pipeline = pipeline.grayscale();
-  }
-
-  let outputBuffer;
-  let outExt;
-  let contentType;
-  let tierLabel;
-
-  if (useJpeg) {
-    outputBuffer = await pipeline
-      .jpeg({ quality, mozjpeg: true, progressive: true })
-      .toBuffer();
-    outExt = 'jpg';
-    contentType = 'image/jpeg';
-    tierLabel = exceedsWebpLimit && !wantJpg ? `jpeg-tall-fallback-q${quality}` : `jpeg-w${estWidth || 'orig'}-q${quality}`;
-  } else {
-    outputBuffer = await pipeline
-      .webp({ quality, effort: 3 })
-      .toBuffer();
-    outExt = 'webp';
-    contentType = 'image/webp';
-    tierLabel = `webp-w${estWidth || 'orig'}-q${quality}`;
-  }
-
-  // No-Gain guard: never deliver a larger compressed payload than the original
-  if (outputBuffer.length >= inputBuffer.length) {
-    return {
-      buffer: inputBuffer,
-      ext: magic === 'jpeg' ? 'jpg' : magic,
-      contentType: `image/${magic}`,
-      tierLabel: 'bypass-no-gain',
-      bypassed: true,
-    };
-  }
-
-  return {
-    buffer: outputBuffer,
-    ext: outExt,
-    contentType,
-    tierLabel,
-    bypassed: false,
-  };
-}
-
-/**
- * Compresses and slices a tall manhwa image into multiple <= maxSliceHeight segments
- * for the Turbo-CBZ /chapter-bundle endpoint (so WebP works even on 30,000px+ strips).
- */
-async function compressAndSliceForBundle(inputBuffer, magic, pageIndexStr, opts) {
-  const maxWidth = clampInt(opts.w, 0, 4096, 900);
-  const quality = clampInt(opts.q ?? opts.l, 10, 95, 65);
-  const wantJpg = opts.jpg === '1' || opts.jpg === 'true' || opts.jpg === true;
-  const wantGrayscale = opts.bw === '1' || opts.bw === 'true' || opts.bw === true;
-  const maxSliceHeight = clampInt(opts.maxSliceHeight, 1500, 12000, 4500);
-
-  const meta = await sharp(inputBuffer, { limitInputPixels: 100_000_000 }).metadata();
-  const isAnimated = (meta.pages || 1) > 1;
-  if (isAnimated || !meta.width || !meta.height) {
-    const single = await compressImageBuffer(inputBuffer, magic, opts);
-    return [{ filename: `${pageIndexStr}.${single.ext}`, buffer: single.buffer }];
-  }
-
-  // First normalize & resize (without encoding yet)
-  let basePipe = sharp(inputBuffer, { limitInputPixels: 100_000_000 });
-  if (maxWidth > 0 && meta.width > maxWidth) {
-    basePipe = basePipe.resize({ width: maxWidth, withoutEnlargement: true });
-  }
-  if (wantGrayscale) {
-    basePipe = basePipe.grayscale();
-  }
-
-  const { data: rawPixels, info } = await basePipe.raw().toBuffer({ resolveWithObject: true });
-
-  // Slice only if tall strip (> 3x width AND > maxSliceHeight)
-  const isTall = info.height / info.width > 3 && info.height > maxSliceHeight;
-  if (!isTall) {
-    const single = await compressImageBuffer(inputBuffer, magic, opts);
-    return [{ filename: `${pageIndexStr}.${single.ext}`, buffer: single.buffer }];
-  }
-
-  const partCount = Math.ceil(info.height / maxSliceHeight);
-  const sliceHeight = Math.floor(info.height / partCount);
-  const slices = [];
-
-  for (let i = 0; i < partCount; i++) {
-    const top = i * sliceHeight;
-    const height = i === partCount - 1 ? info.height - top : sliceHeight;
-    const suffix = String(i + 1).padStart(3, '0');
-
-    let slicePipe = sharp(rawPixels, {
-      raw: { width: info.width, height: info.height, channels: info.channels },
-    }).extract({ left: 0, top, width: info.width, height });
-
-    const outBuf = wantJpg
-      ? await slicePipe.jpeg({ quality, mozjpeg: true }).toBuffer()
-      : await slicePipe.webp({ quality, effort: 3 }).toBuffer();
-
-    slices.push({
-      filename: `${pageIndexStr}__${suffix}.${wantJpg ? 'jpg' : 'webp'}`,
-      buffer: outBuf,
-    });
-  }
-
-  return slices;
-}
-
 function checkAuth(req, parsedUrl) {
   if (!PROXY_KEY) return true;
   const headerKey = (req.headers['x-proxy-key'] || '').toString().trim();
@@ -497,14 +342,27 @@ export async function handleRequest(req, res) {
 
   if (req.method === 'GET' && path === '/health') {
     const mem = process.memoryUsage();
+    const hasCjpegli = Boolean(await detectCjpegliBinary());
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(
       JSON.stringify({
         status: 'ok',
         service: 'komikku-smart-proxy',
-        version: '1.0.0',
-        engine: 'sharp/libvips',
-        features: ['webp', 'mozjpeg', 'resize', 'grayscale', 'referer-forward', 'tall-fallback', 'chapter-bundle'],
+        version: '2.0.0',
+        engine: hasCjpegli ? 'sharp/libvips + google/jpegli' : 'sharp/libvips',
+        features: [
+          'avif-auto',
+          'webp-sharp-yuv',
+          hasCjpegli ? 'google-jpegli' : 'mozjpeg-444',
+          'smart-gutter-trim',
+          'auto-bw-detect',
+          'hazy-scan-leveling',
+          'adaptive-complexity',
+          'seam-aware-slicing',
+          'referer-forward',
+          'tall-fallback',
+          'chapter-bundle-cbz',
+        ],
         authRequired: Boolean(PROXY_KEY),
         uptimeSec: Math.round((Date.now() - serverStats.startedAt) / 1000),
         memoryMb: Math.round(mem.rss / (1024 * 1024)),
@@ -540,6 +398,10 @@ export async function handleRequest(req, res) {
         q: parsedUrl.searchParams.get('q') ?? parsedUrl.searchParams.get('l'),
         jpg: parsedUrl.searchParams.get('jpg'),
         bw: parsedUrl.searchParams.get('bw'),
+        fmt: parsedUrl.searchParams.get('fmt'),
+        trim: parsedUrl.searchParams.get('trim'),
+        autobw: parsedUrl.searchParams.get('autobw'),
+        adaptive: parsedUrl.searchParams.get('adaptive'),
       });
 
       const saved = Math.max(0, origBuf.length - result.buffer.length);
@@ -555,8 +417,15 @@ export async function handleRequest(req, res) {
         'X-Compressed-Size': String(result.buffer.length),
         'X-Saved-Bytes': String(saved),
         'X-Proxy-Tier': result.tierLabel,
+        'X-Format': result.formatName || result.ext,
         'Cache-Control': 'private, max-age=86400',
       };
+      if (result.trimmedPx > 0) {
+        headers['X-Trimmed-Height'] = String(result.trimmedPx);
+      }
+      if (result.autoBw) {
+        headers['X-Auto-BW'] = '1';
+      }
       if (result.bypassed) {
         headers['X-Proxy-Bypass'] = result.tierLabel;
       }

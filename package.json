@@ -1,6 +1,6 @@
 {
   "name": "komikku-smart-proxy",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "SSRF-hardened smart image compression and Turbo-CBZ chapter bundler proxy for Komikku",
   "main": "server.js",
   "type": "module",

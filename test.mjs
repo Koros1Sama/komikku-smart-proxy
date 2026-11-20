@@ -7,6 +7,25 @@ import {
   compressImageBuffer,
   compressAndSliceForBundle,
 } from './server.js';
+import {
+  analyzePageContent,
+  trimVerticalGutters,
+  findSeamAwareCuts,
+  mapQualityToAvif,
+} from './pipeline.js';
+
+function makeNoisyColorBuffer(width, height) {
+  const raw = Buffer.alloc(width * height * 3);
+  let seed = 1337;
+  for (let i = 0; i < raw.length; i += 3) {
+    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+    const v = (seed >>> 24) & 0xff;
+    raw[i] = v;
+    raw[i + 1] = (v + ((i / 3) % 128)) & 0xff;
+    raw[i + 2] = (255 - v) & 0xff;
+  }
+  return raw;
+}
 
 describe('SSRF IP validation', () => {
   it('blocks private, loopback, IMDS, and IPv4-mapped IPv6 addresses', () => {
@@ -52,57 +71,126 @@ describe('Magic-byte image detection', () => {
   });
 });
 
-describe('Image compression & tall-strip handling', () => {
-  it('downscales and compresses a wide PNG manhwa panel to smaller WebP', async () => {
-    // Realistic manhwa-like image with 32-bit LCG noise + gradients so PNG is large
-    const width = 1400;
-    const height = 2000;
-    const raw = Buffer.alloc(width * height * 3);
-    let seed = 1337;
-    for (let i = 0; i < raw.length; i += 3) {
-      seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
-      const v = (seed >>> 24) & 0xff;
-      raw[i] = v;
-      raw[i + 1] = (v + ((i / 3) % 128)) & 0xff;
-      raw[i + 2] = (255 - v) & 0xff;
+describe('V2 Content Analysis, Gutter Trimming & Seam-Aware Slicing', () => {
+  it('detects B&W manga saved as 24-bit RGB vs full-color manhwa', async () => {
+    // 24-bit RGB image with neutral gray + minor scanner tint
+    const bwRaw = Buffer.alloc(200 * 200 * 3);
+    for (let i = 0; i < bwRaw.length; i += 3) {
+      const g = ((i / 3) % 2 === 0) ? 238 : 30;
+      bwRaw[i] = g;
+      bwRaw[i + 1] = g;
+      bwRaw[i + 2] = Math.min(255, g + 2);
     }
-    const png = await sharp(raw, { raw: { width, height, channels: 3 } }).png().toBuffer();
+    const bwPng = await sharp(bwRaw, { raw: { width: 200, height: 200, channels: 3 } }).png().toBuffer();
+    const bwStats = await analyzePageContent(bwPng);
+    assert.equal(bwStats.isGrayscale, true);
+    assert.equal(bwStats.isHazyScan, true);
 
-    const out = await compressImageBuffer(png, 'png', { w: '800', q: '65', jpg: '0', bw: '0' });
-    assert.equal(out.ext, 'webp');
-    assert.equal(out.bypassed, false);
-    assert.ok(out.buffer.length < png.length, `Expected ${out.buffer.length} < ${png.length}`);
+    const colorPng = await sharp(makeNoisyColorBuffer(200, 200), {
+      raw: { width: 200, height: 200, channels: 3 },
+    })
+      .png()
+      .toBuffer();
+    const colorStats = await analyzePageContent(colorPng);
+    assert.equal(colorStats.isGrayscale, false);
+  });
 
-    const meta = await sharp(out.buffer).metadata();
+  it('collapses long solid vertical voids while preserving drawn panels', () => {
+    const width = 400;
+    const height = 3000;
+    const raw = Buffer.alloc(width * height * 3, 255); // solid white background
+    // Panel 1: rows 100..600 (noisy art)
+    const art1 = makeNoisyColorBuffer(width, 500);
+    art1.copy(raw, 100 * width * 3);
+    // Huge 1200px white void: rows 600..1800
+    // Panel 2: rows 1800..2800 (noisy art)
+    const art2 = makeNoisyColorBuffer(width, 1000);
+    art2.copy(raw, 1800 * width * 3);
+
+    const res = trimVerticalGutters(raw, { width, height, channels: 3 });
+    assert.ok(res.trimmedPx >= 900, `Expected >= 900px trimmed, got ${res.trimmedPx}`);
+    assert.equal(res.info.height, height - res.trimmedPx);
+    assert.ok(res.savedHeightPct >= 30);
+  });
+
+  it('chooses clean white gutter instead of cutting through noisy panel art', () => {
+    const width = 400;
+    const height = 7000;
+    // Fill entire image with high-variance noise
+    const raw = makeNoisyColorBuffer(width, height);
+    // Insert a clean 120px solid white gutter at y = 3300..3420 (near target 3500)
+    raw.fill(255, 3300 * width * 3, 3420 * width * 3);
+
+    const slices = findSeamAwareCuts(raw, { width, height, channels: 3 }, 3800);
+    assert.equal(slices.length, 2);
+    const cutY = slices[1].top;
+    assert.ok(
+      cutY >= 3300 && cutY <= 3420,
+      `Expected seam-aware cut inside gutter [3300..3420], got ${cutY}`,
+    );
+  });
+
+  it('maps WebP quality to calibrated AVIF quality cleanly', () => {
+    assert.ok(mapQualityToAvif(82) >= 58 && mapQualityToAvif(82) <= 64);
+    assert.ok(mapQualityToAvif(65) >= 46 && mapQualityToAvif(65) <= 52);
+  });
+});
+
+describe('V2 Image Compression & Smart Codec Routing', () => {
+  it('routes normal-height PNG (<=4000px) to AVIF in auto mode and WebP when fmt=webp', async () => {
+    const png = await sharp(makeNoisyColorBuffer(1200, 1800), {
+      raw: { width: 1200, height: 1800, channels: 3 },
+    })
+      .png()
+      .toBuffer();
+
+    const avifOut = await compressImageBuffer(png, 'png', { w: '800', q: '65', jpg: '0', bw: '0' });
+    assert.equal(avifOut.ext, 'avif');
+    assert.equal(avifOut.bypassed, false);
+    assert.ok(avifOut.buffer.length < png.length);
+
+    const webpOut = await compressImageBuffer(png, 'png', { w: '800', q: '65', fmt: 'webp' });
+    assert.equal(webpOut.ext, 'webp');
+    assert.equal(webpOut.bypassed, false);
+    assert.ok(webpOut.buffer.length < png.length);
+
+    const meta = await sharp(avifOut.buffer).metadata();
     assert.equal(meta.width, 800);
   });
 
-  it('automatically switches to MozJPEG when resized height exceeds WebP 16383px limit', async () => {
+  it('routes tall un-sliced strip (4001..16383px) to WebP for lag-free Korotomi scrolling', async () => {
+    const raw = makeNoisyColorBuffer(600, 6000);
+    const png = await sharp(raw, { raw: { width: 600, height: 6000, channels: 3 } }).png().toBuffer();
+
+    const out = await compressImageBuffer(png, 'png', { w: '600', q: '65', jpg: '0', trim: '0' });
+    assert.equal(out.ext, 'webp');
+    assert.equal(out.bypassed, false);
+  });
+
+  it('automatically switches to MozJPEG/Jpegli when resized height exceeds WebP 16383px limit', async () => {
     const tallPng = await sharp({
       create: { width: 800, height: 17000, channels: 3, background: { r: 220, g: 220, b: 220 } },
     })
       .png()
       .toBuffer();
 
-    const out = await compressImageBuffer(tallPng, 'png', { w: '800', q: '65', jpg: '0' });
+    const out = await compressImageBuffer(tallPng, 'png', { w: '800', q: '65', jpg: '0', trim: '0' });
     assert.equal(out.ext, 'jpg');
-    assert.match(out.tierLabel, /jpeg-tall-fallback/);
+    assert.match(out.tierLabel, /(jpeg-tall-fallback|jpegli-tall)/);
   });
 
-  it('slices ultra-tall strips into <=4500px WebP segments for chapter bundle', async () => {
-    const tallPng = await sharp({
-      create: { width: 1000, height: 12000, channels: 3, background: { r: 100, g: 150, b: 200 } },
-    })
-      .png()
-      .toBuffer();
+  it('slices ultra-tall strips into <=3800px lag-free AVIF segments for chapter bundle', async () => {
+    const raw = makeNoisyColorBuffer(800, 10000);
+    const tallPng = await sharp(raw, { raw: { width: 800, height: 10000, channels: 3 } }).png().toBuffer();
 
     const slices = await compressAndSliceForBundle(tallPng, 'png', '000', {
       w: '800',
       q: '65',
-      maxSliceHeight: '4000',
+      maxSliceHeight: '3800',
+      trim: '0',
     });
-    assert.ok(slices.length >= 2, `Expected multiple slices, got ${slices.length}`);
-    assert.equal(slices[0].filename, '000__001.webp');
-    assert.equal(slices[1].filename, '000__002.webp');
+    assert.ok(slices.length >= 3, `Expected >= 3 slices, got ${slices.length}`);
+    assert.equal(slices[0].filename, '000__001.avif');
+    assert.equal(slices[1].filename, '000__002.avif');
   });
 });
