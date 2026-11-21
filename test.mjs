@@ -9,7 +9,10 @@ import {
   parseForwardedHeaders,
   ByteLruCache,
   PerOriginPoliteLimiter,
+  extractPaginatedNextUrls,
+  handleRequest,
 } from './server.js';
+import { Readable } from 'node:stream';
 import {
   analyzePageContent,
   trimVerticalGutters,
@@ -246,5 +249,73 @@ describe('V2 Image Compression & Smart Codec Routing', () => {
     assert.ok(slices.length >= 3, `Expected >= 3 slices, got ${slices.length}`);
     assert.equal(slices[0].filename, '000__001.avif');
     assert.equal(slices[1].filename, '000__002.avif');
+  });
+});
+
+describe('Polite Speculative Pagination Prefetch & /fetch-batch', () => {
+  it('extracts same-origin next page URLs from paginated chapter HTML and ignores cross-origin or non-page-1', () => {
+    const html = `
+      <nav>
+        <a href="https://olympustaff.com/series/solo?page=2">2</a>
+        <a href="?page=3">3</a>
+        <a href="?page=4">4</a>
+        <a href="?page=5">5</a>
+        <a href="https://evil.example.com/series/solo?page=2">Evil</a>
+      </nav>
+    `;
+    const urls = extractPaginatedNextUrls('https://olympustaff.com/series/solo', html, 3);
+    assert.deepEqual(urls, [
+      'https://olympustaff.com/series/solo?page=2',
+      'https://olympustaff.com/series/solo?page=3',
+      'https://olympustaff.com/series/solo?page=4',
+    ]);
+
+    // Already on page 2 -> do not prefetch again
+    assert.deepEqual(
+      extractPaginatedNextUrls('https://olympustaff.com/series/solo?page=2', html, 3),
+      [],
+    );
+  });
+
+  it('extracts next page URLs from JSON last_page responses', () => {
+    const json = JSON.stringify({ data: [], current_page: 1, last_page: 4 });
+    const urls = extractPaginatedNextUrls('https://api.example.org/chapters?page=1', json, 3);
+    assert.deepEqual(urls, [
+      'https://api.example.org/chapters?page=2',
+      'https://api.example.org/chapters?page=3',
+      'https://api.example.org/chapters?page=4',
+    ]);
+  });
+
+  it('validates /fetch-batch payload limits and enforces SSRF blocking per item', async () => {
+    const invoke = async (payload) => {
+      const req = Readable.from([Buffer.from(JSON.stringify(payload), 'utf8')]);
+      req.method = 'POST';
+      req.url = '/fetch-batch';
+      req.headers = { 'content-type': 'application/json' };
+      let statusCode = 0;
+      const chunks = [];
+      const res = {
+        writeHead(code) {
+          statusCode = code;
+        },
+        end(buf) {
+          if (buf) chunks.push(Buffer.isBuffer(buf) ? buf : Buffer.from(String(buf)));
+        },
+      };
+      await handleRequest(req, res);
+      return { statusCode, body: JSON.parse(Buffer.concat(chunks).toString('utf8')) };
+    };
+
+    const emptyResp = await invoke({ items: [] });
+    assert.equal(emptyResp.statusCode, 400);
+
+    const ssrfResp = await invoke({
+      items: [{ url: 'http://127.0.0.1/admin' }, { url: 'http://169.254.169.254/latest/meta-data/' }],
+    });
+    assert.equal(ssrfResp.statusCode, 200);
+    assert.equal(ssrfResp.body.results.length, 2);
+    assert.equal(ssrfResp.body.results[0].status, 403);
+    assert.equal(ssrfResp.body.results[1].status, 403);
   });
 });

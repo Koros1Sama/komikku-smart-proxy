@@ -133,6 +133,10 @@ export class PerOriginPoliteLimiter {
 }
 
 const originLimiter = new PerOriginPoliteLimiter(3, 150);
+const SPECULATIVE_PREFETCH_MAX_PAGES = 3;
+const HOST_429_COOLDOWN_MS = 10 * 60 * 1000;
+const host429CooldownUntil = new Map();
+const inFlightPrefetches = new Set();
 
 const serverStats = {
   startedAt: Date.now(),
@@ -140,10 +144,120 @@ const serverStats = {
   requestsSuccess: 0,
   requestsFailed: 0,
   cacheHits: 0,
+  speculativePrefetches: 0,
   rateLimit429Count: 0,
   bytesOriginalTotal: 0,
   bytesCompressedTotal: 0,
 };
+
+/**
+ * Extracts up to [maxPages] same-origin paginated next-page URLs (e.g. ?page=2..N)
+ * from a page-1 HTML or JSON chapter list response for polite speculative prefetching.
+ */
+export function extractPaginatedNextUrls(baseUrl, bodyText, maxPages = SPECULATIVE_PREFETCH_MAX_PAGES) {
+  if (!baseUrl || !bodyText || maxPages <= 0) return [];
+  let parsedBase;
+  try {
+    parsedBase = new URL(baseUrl);
+  } catch {
+    return [];
+  }
+  const currentPageParam = parsedBase.searchParams.get('page');
+  if (currentPageParam && currentPageParam !== '1') return [];
+
+  const foundPages = new Map(); // pageNum -> resolvedUrl
+  const addCandidate = (rawHref) => {
+    try {
+      const candidate = new URL(rawHref.replace(/&amp;/g, '&'), parsedBase);
+      if (candidate.origin !== parsedBase.origin) return;
+      if (candidate.pathname !== parsedBase.pathname) return;
+      const p = Number(candidate.searchParams.get('page'));
+      if (!Number.isInteger(p) || p < 2 || p > 20) return;
+      if (!foundPages.has(p)) foundPages.set(p, candidate.toString());
+    } catch {
+      // ignore malformed href
+    }
+  };
+
+  // Match HTML links like href="...?page=2" or href="?page=2"
+  const hrefRegex = /href=["']([^"']*[?&]page=\d+[^"']*)["']/gi;
+  let match;
+  while ((match = hrefRegex.exec(bodyText)) !== null) {
+    addCandidate(match[1]);
+  }
+
+  // Match JSON pagination fields like "last_page": 5 or "next_page_url": "..."
+  const nextUrlRegex = /"next_page_url"\s*:\s*"([^"]+)"/i;
+  const nextMatch = nextUrlRegex.exec(bodyText);
+  if (nextMatch) {
+    addCandidate(nextMatch[1].replace(/\\\//g, '/'));
+  }
+
+  const lastPageRegex = /"(?:last_page|total_pages|lastPage|totalPages)"\s*:\s*(\d+)/i;
+  const lastMatch = lastPageRegex.exec(bodyText);
+  if (lastMatch) {
+    const lastPage = Math.min(Number(lastMatch[1]), 1 + maxPages);
+    for (let p = 2; p <= lastPage; p++) {
+      const u = new URL(parsedBase.toString());
+      u.searchParams.set('page', String(p));
+      if (!foundPages.has(p)) foundPages.set(p, u.toString());
+    }
+  }
+
+  return Array.from(foundPages.entries())
+    .sort((a, b) => a[0] - b[0])
+    .slice(0, maxPages)
+    .map(([, url]) => url);
+}
+
+function schedulePolitePaginationPrefetch(baseUrl, bodyBuffer, contentType, forwardHeaders) {
+  const ct = String(contentType || '').toLowerCase();
+  if (!ct.includes('html') && !ct.includes('json')) return;
+  if (!bodyBuffer || bodyBuffer.length === 0 || bodyBuffer.length > 512 * 1024) return;
+
+  let parsedBase;
+  try {
+    parsedBase = new URL(baseUrl);
+  } catch {
+    return;
+  }
+
+  const hostKey = parsedBase.hostname.toLowerCase();
+  if ((host429CooldownUntil.get(hostKey) || 0) > Date.now()) return;
+
+  const nextUrls = extractPaginatedNextUrls(baseUrl, bodyBuffer.toString('utf8'), SPECULATIVE_PREFETCH_MAX_PAGES);
+  if (nextUrls.length === 0) return;
+
+  // Run sequentially in background; each request passes through PerOriginPoliteLimiter
+  void (async () => {
+    for (const nextUrl of nextUrls) {
+      if ((host429CooldownUntil.get(hostKey) || 0) > Date.now()) break;
+      const cacheKey = `fetch:${nextUrl}`;
+      if (responseCache.get(cacheKey) || inFlightPrefetches.has(cacheKey)) continue;
+      inFlightPrefetches.add(cacheKey);
+      try {
+        const res = await safeFetchUpstreamBridge(nextUrl, {
+          method: 'GET',
+          headers: forwardHeaders,
+          body: null,
+        });
+        if (res.status === 429) {
+          host429CooldownUntil.set(hostKey, Date.now() + HOST_429_COOLDOWN_MS);
+          break;
+        }
+        if (res.status === 200 && res.setCookies.length === 0 && res.body.length <= 512 * 1024) {
+          responseCache.set(cacheKey, res, res.body.length, HTML_CACHE_TTL_MS);
+          serverStats.speculativePrefetches++;
+        }
+      } catch {
+        // Speculative prefetch failure is non-fatal; stop prefetching further pages for this origin
+        break;
+      } finally {
+        inFlightPrefetches.delete(cacheKey);
+      }
+    }
+  })();
+}
 
 /**
  * Checks whether an IPv4 or IPv6 address belongs to a private, loopback,
@@ -540,7 +654,10 @@ async function safeFetchUpstreamBridge(
 
     const req = transport.request(options, (res) => {
       const status = res.statusCode || 502;
-      if (status === 429) serverStats.rateLimit429Count++;
+      if (status === 429) {
+        serverStats.rateLimit429Count++;
+        host429CooldownUntil.set(parsed.hostname.toLowerCase(), Date.now() + HOST_429_COOLDOWN_MS);
+      }
       const rawSetCookie = res.headers['set-cookie'];
       if (Array.isArray(rawSetCookie)) {
         collectedCookies.push(...rawSetCookie);
@@ -693,6 +810,8 @@ export async function handleRequest(req, res) {
           'tall-fallback',
           'chapter-bundle-cbz',
           'zero-vpn-bridge',
+          'fetch-batch',
+          'polite-pagination-prefetch',
           'lru-ram-cache',
           'keepalive-pool',
           'polite-anti-ban-limiter',
@@ -762,6 +881,7 @@ export async function handleRequest(req, res) {
           upstream.body.length <= 512 * 1024
         ) {
           responseCache.set(fetchCacheKey, upstream, upstream.body.length, HTML_CACHE_TTL_MS);
+          schedulePolitePaginationPrefetch(targetUrl, upstream.body, upstream.contentType, forwardHeaders);
         }
       }
 
@@ -794,6 +914,96 @@ export async function handleRequest(req, res) {
       const status = err instanceof HttpError ? err.status : 502;
       res.writeHead(status, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: err.message || 'Zero-VPN bridge fetch failed' }));
+    }
+    return;
+  }
+
+  // Batch Zero-VPN Source Bridge endpoint (strictly bounded + PerOriginPoliteLimiter + RAM LRU cache)
+  if (req.method === 'POST' && path === '/fetch-batch') {
+    serverStats.requestsTotal++;
+    try {
+      const body = await readJsonBody(req);
+      const rawItems = Array.isArray(body?.items)
+        ? body.items
+        : Array.isArray(body?.urls)
+          ? body.urls
+          : [];
+      if (rawItems.length === 0 || rawItems.length > 12) {
+        throw new HttpError(400, 'items/urls array must contain between 1 and 12 entries');
+      }
+      const maxConcurrent = Math.min(3, Math.max(1, Number(body?.maxConcurrent || 2)));
+
+      const results = await runWithConcurrency(rawItems, maxConcurrent, async (entry) => {
+        const descriptor = typeof entry === 'string' ? { url: entry } : (entry || {});
+        const targetUrl = String(descriptor.url || '').trim();
+        if (!targetUrl) {
+          return { url: '', status: 400, cache: 'MISS', error: 'Missing url' };
+        }
+        try {
+          const targetMethod = String(descriptor.method || 'GET').toUpperCase();
+          const encodedHeaders = descriptor.headers && typeof descriptor.headers === 'object'
+            ? Buffer.from(JSON.stringify(descriptor.headers), 'utf8').toString('base64')
+            : null;
+          const forwardHeaders = parseForwardedHeaders(
+            encodedHeaders,
+            descriptor.ref || descriptor.referer,
+            descriptor.ua || descriptor.userAgent || req.headers['user-agent'],
+          );
+          const hasCookie = Boolean(forwardHeaders['Cookie'] || forwardHeaders['cookie']);
+          const cacheKey = targetMethod === 'GET' && !hasCookie ? `fetch:${targetUrl}` : null;
+
+          let upstream = cacheKey ? responseCache.get(cacheKey) : null;
+          let cacheStatus = 'MISS';
+          if (upstream) {
+            cacheStatus = 'HIT';
+            serverStats.cacheHits++;
+          } else {
+            upstream = await safeFetchUpstreamBridge(targetUrl, {
+              method: targetMethod,
+              headers: forwardHeaders,
+              body: descriptor.body ? Buffer.from(String(descriptor.body), 'utf8') : null,
+            });
+            if (
+              cacheKey &&
+              upstream.status === 200 &&
+              upstream.setCookies.length === 0 &&
+              upstream.body.length <= 512 * 1024
+            ) {
+              responseCache.set(cacheKey, upstream, upstream.body.length, HTML_CACHE_TTL_MS);
+            }
+          }
+          return {
+            url: targetUrl,
+            finalUrl: upstream.finalUrl,
+            status: upstream.status,
+            contentType: upstream.contentType,
+            cache: cacheStatus,
+            bodyBase64: upstream.body.toString('base64'),
+          };
+        } catch (err) {
+          const status = err instanceof HttpError ? err.status : 502;
+          return {
+            url: targetUrl,
+            status,
+            cache: 'MISS',
+            error: err.message || 'Batch item fetch failed',
+          };
+        }
+      });
+
+      serverStats.requestsSuccess++;
+      const payload = Buffer.from(JSON.stringify({ results }), 'utf8');
+      res.writeHead(200, {
+        'Content-Type': 'application/json',
+        'Content-Length': payload.length,
+        'X-Proxy-Bridge': 'komikku-batch-v1',
+      });
+      res.end(payload);
+    } catch (err) {
+      serverStats.requestsFailed++;
+      const status = err instanceof HttpError ? err.status : 502;
+      res.writeHead(status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message || 'Batch fetch failed' }));
     }
     return;
   }
