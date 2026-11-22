@@ -1,5 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import http from 'node:http';
+import { PassThrough, Readable } from 'node:stream';
 import sharp from 'sharp';
 import {
   isPrivateOrReservedIp,
@@ -7,12 +9,13 @@ import {
   compressImageBuffer,
   compressAndSliceForBundle,
   parseForwardedHeaders,
+  createPinnedLookup,
+  stripSensitiveCrossOriginHeaders,
   ByteLruCache,
   PerOriginPoliteLimiter,
   extractPaginatedNextUrls,
   handleRequest,
 } from './server.js';
-import { Readable } from 'node:stream';
 import {
   analyzePageContent,
   trimVerticalGutters,
@@ -252,7 +255,71 @@ describe('V2 Image Compression & Smart Codec Routing', () => {
   });
 });
 
-describe('Polite Speculative Pagination Prefetch & /fetch-batch', () => {
+describe('Tier 0 Hardening: Node 20+ Pinned Lookup, Cross-Origin Redirects, Streaming Bundle', () => {
+  it('createPinnedLookup satisfies both Node 20+ autoSelectFamily (opts.all=true) and legacy lookup', async () => {
+    const lookup = createPinnedLookup({ address: '127.0.0.1', family: 4 });
+
+    const allRes = await new Promise((resolve, reject) => {
+      lookup('example.test', { all: true }, (err, list) => (err ? reject(err) : resolve(list)));
+    });
+    assert.deepEqual(allRes, [{ address: '127.0.0.1', family: 4 }]);
+
+    const singleRes = await new Promise((resolve, reject) => {
+      lookup('example.test', { family: 0 }, (err, addr, fam) => (err ? reject(err) : resolve({ addr, fam })));
+    });
+    assert.deepEqual(singleRes, { addr: '127.0.0.1', fam: 4 });
+
+    // Real Node 20+ socket test with http.request using createPinnedLookup
+    const localServer = http.createServer((_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      res.end('ok-pinned');
+    });
+    await new Promise((resolve) => localServer.listen(0, '127.0.0.1', resolve));
+    const { port } = localServer.address();
+    try {
+      const body = await new Promise((resolve, reject) => {
+        const req = http.request(
+          {
+            hostname: 'pinned.invalid',
+            port,
+            path: '/',
+            method: 'GET',
+            lookup: createPinnedLookup({ address: '127.0.0.1', family: 4 }),
+          },
+          (res) => {
+            const chunks = [];
+            res.on('data', (c) => chunks.push(c));
+            res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+          },
+        );
+        req.on('error', reject);
+        req.end();
+      });
+      assert.equal(body, 'ok-pinned');
+    } finally {
+      await new Promise((resolve) => localServer.close(resolve));
+    }
+  });
+
+  it('stripSensitiveCrossOriginHeaders removes Cookie, Authorization, Proxy-Authorization, Referer, Origin', () => {
+    const stripped = stripSensitiveCrossOriginHeaders({
+      Cookie: 'sid=secret',
+      Authorization: 'Bearer tok',
+      'Proxy-Authorization': 'Basic abc',
+      Referer: 'https://source-a.example/ch1',
+      Origin: 'https://source-a.example',
+      'User-Agent': 'Korotomi/1.0',
+      Accept: '*/*',
+    });
+    assert.equal(stripped.Cookie, undefined);
+    assert.equal(stripped.Authorization, undefined);
+    assert.equal(stripped['Proxy-Authorization'], undefined);
+    assert.equal(stripped.Referer, undefined);
+    assert.equal(stripped.Origin, undefined);
+    assert.equal(stripped['User-Agent'], 'Korotomi/1.0');
+    assert.equal(stripped.Accept, '*/*');
+  });
+
   it('extracts same-origin next page URLs from paginated chapter HTML and ignores cross-origin or non-page-1', () => {
     const html = `
       <nav>
@@ -287,35 +354,47 @@ describe('Polite Speculative Pagination Prefetch & /fetch-batch', () => {
     ]);
   });
 
-  it('validates /fetch-batch payload limits and enforces SSRF blocking per item', async () => {
-    const invoke = async (payload) => {
+  it('streams /chapter-bundle ZIP with _bundle_meta.json, enforces limits & SSRF blocking, and removes /fetch-batch', async () => {
+    const invoke = async (urlPath, payload) => {
       const req = Readable.from([Buffer.from(JSON.stringify(payload), 'utf8')]);
       req.method = 'POST';
-      req.url = '/fetch-batch';
+      req.url = urlPath;
       req.headers = { 'content-type': 'application/json' };
       let statusCode = 0;
+      let headers = {};
+      const res = new PassThrough();
       const chunks = [];
-      const res = {
-        writeHead(code) {
-          statusCode = code;
-        },
-        end(buf) {
-          if (buf) chunks.push(Buffer.isBuffer(buf) ? buf : Buffer.from(String(buf)));
-        },
+      res.on('data', (c) => chunks.push(c));
+      res.writeHead = (code, hdrs) => {
+        statusCode = code;
+        headers = hdrs || {};
       };
       await handleRequest(req, res);
-      return { statusCode, body: JSON.parse(Buffer.concat(chunks).toString('utf8')) };
+      return { statusCode, headers, raw: Buffer.concat(chunks) };
     };
 
-    const emptyResp = await invoke({ items: [] });
-    assert.equal(emptyResp.statusCode, 400);
+    // Dead /fetch-batch endpoint should return 404
+    const deadBatch = await invoke('/fetch-batch', { items: [{ url: 'https://example.com' }] });
+    assert.equal(deadBatch.statusCode, 404);
 
-    const ssrfResp = await invoke({
-      items: [{ url: 'http://127.0.0.1/admin' }, { url: 'http://169.254.169.254/latest/meta-data/' }],
+    // Empty pages array should return 400
+    const emptyBundle = await invoke('/chapter-bundle', { pages: [] });
+    assert.equal(emptyBundle.statusCode, 400);
+
+    // SSRF pages should stream a valid ZIP (PK\x03\x04) containing _bundle_meta.json with failedPages
+    const ssrfBundle = await invoke('/chapter-bundle', {
+      pages: [
+        { index: 0, url: 'http://127.0.0.1/secret.png' },
+        { index: 1, url: 'http://169.254.169.254/latest/meta-data/' },
+      ],
     });
-    assert.equal(ssrfResp.statusCode, 200);
-    assert.equal(ssrfResp.body.results.length, 2);
-    assert.equal(ssrfResp.body.results[0].status, 403);
-    assert.equal(ssrfResp.body.results[1].status, 403);
+    assert.equal(ssrfBundle.statusCode, 200);
+    assert.equal(ssrfBundle.headers['X-Bundle-Mode'], 'streaming-v2');
+    // ZIP magic bytes PK\x03\x04
+    assert.equal(ssrfBundle.raw[0], 0x50);
+    assert.equal(ssrfBundle.raw[1], 0x4b);
+    const zipAscii = ssrfBundle.raw.toString('utf8');
+    assert.ok(zipAscii.includes('_bundle_meta.json'));
+    assert.ok(zipAscii.includes('"succeededPages":0'));
   });
 });

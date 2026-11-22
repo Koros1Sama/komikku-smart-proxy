@@ -3,6 +3,7 @@ import https from 'node:https';
 import dns from 'node:dns';
 import net from 'node:net';
 import zlib from 'node:zlib';
+import { promisify } from 'node:util';
 import { URL } from 'node:url';
 import sharp from 'sharp';
 import archiver from 'archiver';
@@ -11,6 +12,11 @@ import {
   compressAndSliceForBundleV2 as compressAndSliceForBundle,
   detectCjpegliBinary,
 } from './pipeline.js';
+
+const gzipAsync = promisify(zlib.gzip);
+const gunzipAsync = promisify(zlib.gunzip);
+const brotliDecompressAsync = promisify(zlib.brotliDecompress);
+const inflateAsync = promisify(zlib.inflate);
 
 const PORT = Number(process.env.PORT || 7860);
 const PROXY_KEY = (process.env.PROXY_KEY || '').trim();
@@ -28,9 +34,62 @@ const DEFAULT_UA =
 const httpKeepAliveAgent = new http.Agent({ keepAlive: true, maxSockets: 32, maxFreeSockets: 16 });
 const httpsKeepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 32, maxFreeSockets: 16 });
 
-// Prevent libvips from blowing RAM on constrained free hosts
+// Keep libvips memory strictly bounded on 512MB Render Free containers
 sharp.concurrency(2);
-sharp.cache({ memory: 64, files: 0, items: 50 });
+sharp.cache({ memory: 24, files: 0, items: 20 });
+
+// Global semaphore bounding concurrent sharp image encodes across all requests (prevents 512MB OOM)
+const SHARP_MAX_CONCURRENT = Math.max(1, Number(process.env.SHARP_MAX_CONCURRENT || 2));
+let sharpActive = 0;
+const sharpWaiters = [];
+function withSharpSlot(fn) {
+  return new Promise((resolve, reject) => {
+    const start = () => {
+      sharpActive++;
+      Promise.resolve()
+        .then(fn)
+        .then(resolve, reject)
+        .finally(() => {
+          sharpActive--;
+          const next = sharpWaiters.shift();
+          if (next) next();
+        });
+    };
+    if (sharpActive < SHARP_MAX_CONCURRENT) start();
+    else sharpWaiters.push(start);
+  });
+}
+
+/**
+ * Node 20+ autoSelectFamily-compatible custom lookup function.
+ * Supports both opts.all === true (returns [{ address, family }]) and legacy single-address callback.
+ */
+export function createPinnedLookup(resolved) {
+  return (_host, opts, cb) => {
+    const callback = typeof opts === 'function' ? opts : cb;
+    if (opts && typeof opts === 'object' && opts.all) {
+      return callback(null, [{ address: resolved.address, family: resolved.family }]);
+    }
+    return callback(null, resolved.address, resolved.family);
+  };
+}
+
+export function stripSensitiveCrossOriginHeaders(headersObj) {
+  const clean = { ...headersObj };
+  for (const key of Object.keys(clean)) {
+    const lower = key.toLowerCase();
+    if (
+      lower === 'cookie' ||
+      lower === 'authorization' ||
+      lower === 'proxy-authorization' ||
+      lower === 'referer' ||
+      lower === 'origin'
+    ) {
+      delete clean[key];
+    }
+  }
+  return clean;
+}
 
 /**
  * Bounded byte-size LRU cache with per-entry TTL for covers and /fetch GET pages.
@@ -410,113 +469,115 @@ export function detectImageMagic(buf) {
 /**
  * Performs an SSRF-safe HTTP(S) GET with pinned DNS IP and manual redirect validation.
  */
-async function safeFetchImageBuffer(targetUrl, { referer, userAgent } = {}, redirectDepth = 0) {
-  if (redirectDepth > MAX_REDIRECTS) {
-    throw new HttpError(502, 'Too many redirects');
-  }
-
-  const parsed = validateTargetUrl(targetUrl);
-  const resolved = await resolveAndValidateHost(parsed.hostname);
-  const isHttps = parsed.protocol === 'https:';
-  const transport = isHttps ? https : http;
-
+async function safeFetchImageBuffer(targetUrl, { referer, userAgent } = {}) {
   const safeRef = sanitizeReferer(referer);
   const safeUa = (userAgent || DEFAULT_UA).replace(/[\r\n]/g, ' ').slice(0, 300);
 
-  const reqHeaders = {
-    'User-Agent': safeUa,
-    Accept: 'image/avif,image/webp,image/png,image/jpeg,image/*;q=0.8,*/*;q=0.5',
-    'Accept-Language': 'ar,en-US;q=0.9,en;q=0.8',
-    'Accept-Encoding': 'identity', // keep byte count predictable and avoid double work
-  };
-  if (safeRef) {
-    reqHeaders['Referer'] = safeRef;
-    try {
-      reqHeaders['Origin'] = new URL(safeRef).origin;
-    } catch {
-      // ignore invalid origin
+  let currentUrl = targetUrl;
+  let currentRef = safeRef;
+
+  for (let depth = 0; depth <= MAX_REDIRECTS; depth++) {
+    const parsed = validateTargetUrl(currentUrl);
+    const resolved = await resolveAndValidateHost(parsed.hostname);
+    const isHttps = parsed.protocol === 'https:';
+    const transport = isHttps ? https : http;
+
+    const reqHeaders = {
+      'User-Agent': safeUa,
+      Accept: 'image/avif,image/webp,image/png,image/jpeg,image/*;q=0.8,*/*;q=0.5',
+      'Accept-Language': 'ar,en-US;q=0.9,en;q=0.8',
+      'Accept-Encoding': 'identity',
+    };
+    if (currentRef) {
+      reqHeaders['Referer'] = currentRef;
+      try {
+        reqHeaders['Origin'] = new URL(currentRef).origin;
+      } catch {
+        // ignore invalid origin
+      }
     }
+
+    // Release originLimiter slot BEFORE following any redirect (prevents same-host deadlock!)
+    const hop = await originLimiter.run(parsed.hostname, () => new Promise((resolve, reject) => {
+      const options = {
+        hostname: parsed.hostname,
+        port: parsed.port || (isHttps ? 443 : 80),
+        path: `${parsed.pathname}${parsed.search}`,
+        method: 'GET',
+        headers: reqHeaders,
+        timeout: FETCH_TIMEOUT_MS,
+        agent: isHttps ? httpsKeepAliveAgent : httpKeepAliveAgent,
+        lookup: createPinnedLookup(resolved),
+      };
+
+      const req = transport.request(options, (res) => {
+        const status = res.statusCode || 0;
+
+        if (status >= 300 && status < 400 && res.headers.location) {
+          res.resume();
+          let nextUrl;
+          try {
+            nextUrl = new URL(res.headers.location, parsed).toString();
+          } catch {
+            return reject(new HttpError(502, 'Invalid redirect location'));
+          }
+          const sameOrigin = new URL(nextUrl).origin === parsed.origin;
+          return resolve({ redirectTo: nextUrl, sameOrigin });
+        }
+
+        if (status < 200 || status >= 300) {
+          res.resume();
+          if (status === 429) serverStats.rateLimit429Count++;
+          return reject(new HttpError(status === 403 || status === 429 ? status : 502, `Upstream returned HTTP ${status}`));
+        }
+
+        const contentLen = Number(res.headers['content-length'] || 0);
+        if (contentLen > MAX_DOWNLOAD_BYTES) {
+          res.destroy();
+          return reject(new HttpError(413, 'Upstream image exceeds max size cap'));
+        }
+
+        const chunks = [];
+        let totalBytes = 0;
+
+        res.on('data', (chunk) => {
+          totalBytes += chunk.length;
+          if (totalBytes > MAX_DOWNLOAD_BYTES) {
+            res.destroy();
+            return reject(new HttpError(413, 'Upstream image exceeded max download size'));
+          }
+          chunks.push(chunk);
+        });
+
+        res.on('end', () => {
+          const buffer = Buffer.concat(chunks);
+          const magic = detectImageMagic(buffer);
+          if (!magic) {
+            return reject(new HttpError(502, 'Upstream response is not a valid raster image (possible HTML/CF challenge)'));
+          }
+          resolve({ buffer, magic, upstreamStatus: status });
+        });
+
+        res.on('error', (err) => reject(new HttpError(502, err.message)));
+      });
+
+      req.on('timeout', () => {
+        req.destroy();
+        reject(new HttpError(504, 'Upstream fetch timed out'));
+      });
+      req.on('error', (err) => reject(new HttpError(502, err.message)));
+      req.end();
+    }));
+
+    if (hop.redirectTo) {
+      currentUrl = hop.redirectTo;
+      if (!hop.sameOrigin) currentRef = undefined;
+      continue;
+    }
+    return hop;
   }
 
-  return originLimiter.run(parsed.hostname, () => new Promise((resolve, reject) => {
-    const options = {
-      hostname: parsed.hostname,
-      port: parsed.port || (isHttps ? 443 : 80),
-      path: `${parsed.pathname}${parsed.search}`,
-      method: 'GET',
-      headers: reqHeaders,
-      timeout: FETCH_TIMEOUT_MS,
-      agent: isHttps ? httpsKeepAliveAgent : httpKeepAliveAgent,
-      // Pin socket to already-validated IP so DNS cannot rebind between check and connect
-      lookup: (_host, _opts, cb) => cb(null, resolved.address, resolved.family),
-    };
-
-    const req = transport.request(options, (res) => {
-      const status = res.statusCode || 0;
-
-      if (status >= 300 && status < 400 && res.headers.location) {
-        res.resume();
-        let nextUrl;
-        try {
-          nextUrl = new URL(res.headers.location, parsed).toString();
-        } catch {
-          return reject(new HttpError(502, 'Invalid redirect location'));
-        }
-        // Only preserve Referer on same-origin redirects
-        const sameOrigin = new URL(nextUrl).origin === parsed.origin;
-        safeFetchImageBuffer(
-          nextUrl,
-          { referer: sameOrigin ? safeRef : undefined, userAgent: safeUa },
-          redirectDepth + 1,
-        )
-          .then(resolve)
-          .catch(reject);
-        return;
-      }
-
-      if (status < 200 || status >= 300) {
-        res.resume();
-        if (status === 429) serverStats.rateLimit429Count++;
-        return reject(new HttpError(status === 403 || status === 429 ? status : 502, `Upstream returned HTTP ${status}`));
-      }
-
-      const contentLen = Number(res.headers['content-length'] || 0);
-      if (contentLen > MAX_DOWNLOAD_BYTES) {
-        res.destroy();
-        return reject(new HttpError(413, 'Upstream image exceeds max size cap'));
-      }
-
-      const chunks = [];
-      let totalBytes = 0;
-
-      res.on('data', (chunk) => {
-        totalBytes += chunk.length;
-        if (totalBytes > MAX_DOWNLOAD_BYTES) {
-          res.destroy();
-          return reject(new HttpError(413, 'Upstream image exceeded max download size'));
-        }
-        chunks.push(chunk);
-      });
-
-      res.on('end', () => {
-        const buffer = Buffer.concat(chunks);
-        const magic = detectImageMagic(buffer);
-        if (!magic) {
-          return reject(new HttpError(502, 'Upstream response is not a valid raster image (possible HTML/CF challenge)'));
-        }
-        resolve({ buffer, magic, upstreamStatus: status });
-      });
-
-      res.on('error', (err) => reject(new HttpError(502, err.message)));
-    });
-
-    req.on('timeout', () => {
-      req.destroy();
-      reject(new HttpError(504, 'Upstream fetch timed out'));
-    });
-    req.on('error', (err) => reject(new HttpError(502, err.message)));
-    req.end();
-  }));
+  throw new HttpError(502, 'Too many redirects');
 }
 
 function checkAuth(req, parsedUrl) {
@@ -581,14 +642,18 @@ export function parseForwardedHeaders(encodedHeader, fallbackRef, fallbackUa) {
   return clean;
 }
 
-function decompressUpstreamBody(buffer, contentEncoding) {
+async function decompressUpstreamBody(buffer, contentEncoding) {
   const enc = String(contentEncoding || '').toLowerCase().trim();
   if (!enc || buffer.length === 0) return buffer;
+  const opts = { maxOutputLength: MAX_FETCH_BYTES };
   try {
-    if (enc.includes('br')) return zlib.brotliDecompressSync(buffer);
-    if (enc.includes('gzip')) return zlib.gunzipSync(buffer);
-    if (enc.includes('deflate')) return zlib.inflateSync(buffer);
-  } catch {
+    if (enc.includes('br')) return await brotliDecompressAsync(buffer, opts);
+    if (enc.includes('gzip')) return await gunzipAsync(buffer, opts);
+    if (enc.includes('deflate')) return await inflateAsync(buffer, opts);
+  } catch (err) {
+    if (err && err.code === 'ERR_BUFFER_TOO_LARGE') {
+      throw new HttpError(413, 'Decompressed upstream body exceeds size cap');
+    }
     return buffer;
   }
   return buffer;
@@ -619,119 +684,134 @@ function readRawBody(req, maxBytes = 2 * 1024 * 1024) {
 async function safeFetchUpstreamBridge(
   targetUrl,
   { method = 'GET', headers = {}, body = null, collectedCookies = [] } = {},
-  redirectDepth = 0,
 ) {
-  if (redirectDepth > MAX_REDIRECTS) {
-    throw new HttpError(502, 'Too many redirects');
-  }
-
-  const parsed = validateTargetUrl(targetUrl);
-  const resolved = await resolveAndValidateHost(parsed.hostname);
-  const isHttps = parsed.protocol === 'https:';
-  const transport = isHttps ? https : http;
-  const upperMethod = ['GET', 'POST', 'HEAD', 'OPTIONS'].includes(String(method).toUpperCase())
+  let currentUrl = targetUrl;
+  let currentMethod = ['GET', 'POST', 'HEAD', 'OPTIONS', 'PUT', 'PATCH', 'DELETE'].includes(String(method).toUpperCase())
     ? String(method).toUpperCase()
     : 'GET';
+  let currentHeaders = { ...headers };
+  let currentBody = body;
 
-  const reqHeaders = { ...headers };
-  if (body && body.length > 0 && upperMethod === 'POST') {
-    reqHeaders['Content-Length'] = String(body.length);
-  } else {
-    delete reqHeaders['Content-Length'];
+  for (let depth = 0; depth <= MAX_REDIRECTS; depth++) {
+    const parsed = validateTargetUrl(currentUrl);
+    const resolved = await resolveAndValidateHost(parsed.hostname);
+    const isHttps = parsed.protocol === 'https:';
+    const transport = isHttps ? https : http;
+
+    const reqHeaders = { ...currentHeaders };
+    const hasBodyMethod = currentMethod === 'POST' || currentMethod === 'PUT' || currentMethod === 'PATCH';
+    if (currentBody && currentBody.length > 0 && hasBodyMethod) {
+      reqHeaders['Content-Length'] = String(currentBody.length);
+    } else {
+      delete reqHeaders['Content-Length'];
+    }
+
+    // Release originLimiter slot BEFORE following redirects (prevents same-host deadlock!)
+    const hop = await originLimiter.run(parsed.hostname, () => new Promise((resolve, reject) => {
+      const options = {
+        hostname: parsed.hostname,
+        port: parsed.port || (isHttps ? 443 : 80),
+        path: `${parsed.pathname}${parsed.search}`,
+        method: currentMethod,
+        headers: reqHeaders,
+        timeout: FETCH_TIMEOUT_MS,
+        agent: isHttps ? httpsKeepAliveAgent : httpKeepAliveAgent,
+        lookup: createPinnedLookup(resolved),
+      };
+
+      const req = transport.request(options, (res) => {
+        const status = res.statusCode || 502;
+        if (status === 429) {
+          serverStats.rateLimit429Count++;
+          host429CooldownUntil.set(parsed.hostname.toLowerCase(), Date.now() + HOST_429_COOLDOWN_MS);
+        }
+        const rawSetCookie = res.headers['set-cookie'];
+        if (Array.isArray(rawSetCookie)) {
+          collectedCookies.push(...rawSetCookie);
+        } else if (typeof rawSetCookie === 'string') {
+          collectedCookies.push(rawSetCookie);
+        }
+
+        if ([301, 302, 303, 307, 308].includes(status) && res.headers.location) {
+          res.resume();
+          let nextUrl;
+          try {
+            nextUrl = new URL(res.headers.location, parsed).toString();
+          } catch {
+            return reject(new HttpError(502, 'Invalid redirect location'));
+          }
+          const sameOrigin = new URL(nextUrl).origin === parsed.origin;
+          const convertToGet = status === 301 || status === 302 || status === 303;
+          let nextHeaders = sameOrigin ? { ...reqHeaders } : stripSensitiveCrossOriginHeaders(reqHeaders);
+          if (convertToGet) {
+            delete nextHeaders['Content-Type'];
+            delete nextHeaders['content-type'];
+            delete nextHeaders['Content-Length'];
+          }
+          return resolve({
+            redirectTo: nextUrl,
+            nextMethod: convertToGet ? 'GET' : currentMethod,
+            nextHeaders,
+            nextBody: convertToGet ? null : currentBody,
+          });
+        }
+
+        const chunks = [];
+        let totalBytes = 0;
+
+        res.on('data', (chunk) => {
+          totalBytes += chunk.length;
+          if (totalBytes > MAX_FETCH_BYTES) {
+            res.destroy();
+            return reject(new HttpError(413, 'Upstream response exceeded max bridge size'));
+          }
+          chunks.push(chunk);
+        });
+
+        res.on('end', () => {
+          resolve({
+            status,
+            contentType: res.headers['content-type'] || 'text/html; charset=utf-8',
+            rawBody: Buffer.concat(chunks),
+            contentEncoding: res.headers['content-encoding'],
+            finalUrl: parsed.toString(),
+            setCookies: collectedCookies,
+          });
+        });
+
+        res.on('error', (err) => reject(new HttpError(502, err.message)));
+      });
+
+      req.on('timeout', () => {
+        req.destroy();
+        reject(new HttpError(504, 'Upstream bridge fetch timed out'));
+      });
+      req.on('error', (err) => reject(new HttpError(502, err.message)));
+      if (currentBody && currentBody.length > 0 && hasBodyMethod) {
+        req.write(currentBody);
+      }
+      req.end();
+    }));
+
+    if (hop.redirectTo) {
+      currentUrl = hop.redirectTo;
+      currentMethod = hop.nextMethod;
+      currentHeaders = hop.nextHeaders;
+      currentBody = hop.nextBody;
+      continue;
+    }
+
+    const decompressed = await decompressUpstreamBody(hop.rawBody, hop.contentEncoding);
+    return {
+      status: hop.status,
+      contentType: hop.contentType,
+      body: decompressed,
+      finalUrl: hop.finalUrl,
+      setCookies: hop.setCookies,
+    };
   }
 
-  return originLimiter.run(parsed.hostname, () => new Promise((resolve, reject) => {
-    const options = {
-      hostname: parsed.hostname,
-      port: parsed.port || (isHttps ? 443 : 80),
-      path: `${parsed.pathname}${parsed.search}`,
-      method: upperMethod,
-      headers: reqHeaders,
-      timeout: FETCH_TIMEOUT_MS,
-      agent: isHttps ? httpsKeepAliveAgent : httpKeepAliveAgent,
-      lookup: (_host, _opts, cb) => cb(null, resolved.address, resolved.family),
-    };
-
-    const req = transport.request(options, (res) => {
-      const status = res.statusCode || 502;
-      if (status === 429) {
-        serverStats.rateLimit429Count++;
-        host429CooldownUntil.set(parsed.hostname.toLowerCase(), Date.now() + HOST_429_COOLDOWN_MS);
-      }
-      const rawSetCookie = res.headers['set-cookie'];
-      if (Array.isArray(rawSetCookie)) {
-        collectedCookies.push(...rawSetCookie);
-      } else if (typeof rawSetCookie === 'string') {
-        collectedCookies.push(rawSetCookie);
-      }
-
-      if ([301, 302, 303, 307, 308].includes(status) && res.headers.location) {
-        res.resume();
-        let nextUrl;
-        try {
-          nextUrl = new URL(res.headers.location, parsed).toString();
-        } catch {
-          return reject(new HttpError(502, 'Invalid redirect location'));
-        }
-        const convertToGet = status === 301 || status === 302 || status === 303;
-        const nextHeaders = { ...reqHeaders };
-        if (convertToGet) {
-          delete nextHeaders['Content-Type'];
-          delete nextHeaders['content-type'];
-          delete nextHeaders['Content-Length'];
-        }
-        safeFetchUpstreamBridge(
-          nextUrl,
-          {
-            method: convertToGet ? 'GET' : upperMethod,
-            headers: nextHeaders,
-            body: convertToGet ? null : body,
-            collectedCookies,
-          },
-          redirectDepth + 1,
-        )
-          .then(resolve)
-          .catch(reject);
-        return;
-      }
-
-      const chunks = [];
-      let totalBytes = 0;
-
-      res.on('data', (chunk) => {
-        totalBytes += chunk.length;
-        if (totalBytes > MAX_FETCH_BYTES) {
-          res.destroy();
-          return reject(new HttpError(413, 'Upstream response exceeded max bridge size'));
-        }
-        chunks.push(chunk);
-      });
-
-      res.on('end', () => {
-        const rawBuf = Buffer.concat(chunks);
-        const decompressed = decompressUpstreamBody(rawBuf, res.headers['content-encoding']);
-        resolve({
-          status,
-          contentType: res.headers['content-type'] || 'text/html; charset=utf-8',
-          body: decompressed,
-          finalUrl: parsed.toString(),
-          setCookies: collectedCookies,
-        });
-      });
-
-      res.on('error', (err) => reject(new HttpError(502, err.message)));
-    });
-
-    req.on('timeout', () => {
-      req.destroy();
-      reject(new HttpError(504, 'Upstream bridge fetch timed out'));
-    });
-    req.on('error', (err) => reject(new HttpError(502, err.message)));
-    if (body && body.length > 0 && upperMethod === 'POST') {
-      req.write(body);
-    }
-    req.end();
-  }));
+  throw new HttpError(502, 'Too many redirects');
 }
 
 function readJsonBody(req, maxBytes = 1024 * 1024) {
@@ -794,7 +874,7 @@ export async function handleRequest(req, res) {
       JSON.stringify({
         status: 'ok',
         service: 'komikku-smart-proxy',
-        version: '2.3.0',
+        version: '2.4.0',
         engine: hasCjpegli ? 'sharp/libvips + google/jpegli' : 'sharp/libvips',
         features: [
           'avif-auto',
@@ -808,9 +888,8 @@ export async function handleRequest(req, res) {
           'seam-aware-slicing',
           'referer-forward',
           'tall-fallback',
-          'chapter-bundle-cbz',
+          'chapter-bundle-cbz-streaming',
           'zero-vpn-bridge',
-          'fetch-batch',
           'polite-pagination-prefetch',
           'lru-ram-cache',
           'keepalive-pool',
@@ -858,9 +937,13 @@ export async function handleRequest(req, res) {
       );
       const reqBody = req.method === 'POST' ? await readRawBody(req) : null;
       const clientAcceptsGzip = String(req.headers['accept-encoding'] || '').includes('gzip');
+      const hasAuthHeader = Object.keys(forwardHeaders).some((k) => {
+        const lk = k.toLowerCase();
+        return lk === 'authorization' || lk === 'cookie' || lk === 'proxy-authorization';
+      });
       const noCacheReq =
         String(forwardHeaders['Cache-Control'] || forwardHeaders['cache-control'] || '').includes('no-cache') ||
-        Boolean(forwardHeaders['Cookie'] || forwardHeaders['cookie']);
+        hasAuthHeader;
       const fetchCacheKey = targetMethod === 'GET' && !noCacheReq ? `fetch:${targetUrl}` : null;
 
       let upstream = fetchCacheKey ? responseCache.get(fetchCacheKey) : null;
@@ -886,7 +969,7 @@ export async function handleRequest(req, res) {
       }
 
       const shouldGzip = clientAcceptsGzip && upstream.body.length > 512;
-      const outBody = shouldGzip ? zlib.gzipSync(upstream.body) : upstream.body;
+      const outBody = shouldGzip ? await gzipAsync(upstream.body) : upstream.body;
 
       serverStats.requestsSuccess++;
       const resHeaders = {
@@ -914,96 +997,6 @@ export async function handleRequest(req, res) {
       const status = err instanceof HttpError ? err.status : 502;
       res.writeHead(status, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: err.message || 'Zero-VPN bridge fetch failed' }));
-    }
-    return;
-  }
-
-  // Batch Zero-VPN Source Bridge endpoint (strictly bounded + PerOriginPoliteLimiter + RAM LRU cache)
-  if (req.method === 'POST' && path === '/fetch-batch') {
-    serverStats.requestsTotal++;
-    try {
-      const body = await readJsonBody(req);
-      const rawItems = Array.isArray(body?.items)
-        ? body.items
-        : Array.isArray(body?.urls)
-          ? body.urls
-          : [];
-      if (rawItems.length === 0 || rawItems.length > 12) {
-        throw new HttpError(400, 'items/urls array must contain between 1 and 12 entries');
-      }
-      const maxConcurrent = Math.min(3, Math.max(1, Number(body?.maxConcurrent || 2)));
-
-      const results = await runWithConcurrency(rawItems, maxConcurrent, async (entry) => {
-        const descriptor = typeof entry === 'string' ? { url: entry } : (entry || {});
-        const targetUrl = String(descriptor.url || '').trim();
-        if (!targetUrl) {
-          return { url: '', status: 400, cache: 'MISS', error: 'Missing url' };
-        }
-        try {
-          const targetMethod = String(descriptor.method || 'GET').toUpperCase();
-          const encodedHeaders = descriptor.headers && typeof descriptor.headers === 'object'
-            ? Buffer.from(JSON.stringify(descriptor.headers), 'utf8').toString('base64')
-            : null;
-          const forwardHeaders = parseForwardedHeaders(
-            encodedHeaders,
-            descriptor.ref || descriptor.referer,
-            descriptor.ua || descriptor.userAgent || req.headers['user-agent'],
-          );
-          const hasCookie = Boolean(forwardHeaders['Cookie'] || forwardHeaders['cookie']);
-          const cacheKey = targetMethod === 'GET' && !hasCookie ? `fetch:${targetUrl}` : null;
-
-          let upstream = cacheKey ? responseCache.get(cacheKey) : null;
-          let cacheStatus = 'MISS';
-          if (upstream) {
-            cacheStatus = 'HIT';
-            serverStats.cacheHits++;
-          } else {
-            upstream = await safeFetchUpstreamBridge(targetUrl, {
-              method: targetMethod,
-              headers: forwardHeaders,
-              body: descriptor.body ? Buffer.from(String(descriptor.body), 'utf8') : null,
-            });
-            if (
-              cacheKey &&
-              upstream.status === 200 &&
-              upstream.setCookies.length === 0 &&
-              upstream.body.length <= 512 * 1024
-            ) {
-              responseCache.set(cacheKey, upstream, upstream.body.length, HTML_CACHE_TTL_MS);
-            }
-          }
-          return {
-            url: targetUrl,
-            finalUrl: upstream.finalUrl,
-            status: upstream.status,
-            contentType: upstream.contentType,
-            cache: cacheStatus,
-            bodyBase64: upstream.body.toString('base64'),
-          };
-        } catch (err) {
-          const status = err instanceof HttpError ? err.status : 502;
-          return {
-            url: targetUrl,
-            status,
-            cache: 'MISS',
-            error: err.message || 'Batch item fetch failed',
-          };
-        }
-      });
-
-      serverStats.requestsSuccess++;
-      const payload = Buffer.from(JSON.stringify({ results }), 'utf8');
-      res.writeHead(200, {
-        'Content-Type': 'application/json',
-        'Content-Length': payload.length,
-        'X-Proxy-Bridge': 'komikku-batch-v1',
-      });
-      res.end(payload);
-    } catch (err) {
-      serverStats.requestsFailed++;
-      const status = err instanceof HttpError ? err.status : 502;
-      res.writeHead(status, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: err.message || 'Batch fetch failed' }));
     }
     return;
   }
@@ -1046,16 +1039,18 @@ export async function handleRequest(req, res) {
       }
 
       const { buffer: origBuf, magic } = await safeFetchImageBuffer(targetUrl, { referer, userAgent });
-      const result = await compressImageBuffer(origBuf, magic, {
-        w: wParam,
-        q: qParam,
-        jpg: jpgParam,
-        bw: bwParam,
-        fmt: fmtParam,
-        trim: parsedUrl.searchParams.get('trim'),
-        autobw: parsedUrl.searchParams.get('autobw'),
-        adaptive: parsedUrl.searchParams.get('adaptive'),
-      });
+      const result = await withSharpSlot(() =>
+        compressImageBuffer(origBuf, magic, {
+          w: wParam,
+          q: qParam,
+          jpg: jpgParam,
+          bw: bwParam,
+          fmt: fmtParam,
+          trim: parsedUrl.searchParams.get('trim'),
+          autobw: parsedUrl.searchParams.get('autobw'),
+          adaptive: parsedUrl.searchParams.get('adaptive'),
+        }),
+      );
 
       const saved = Math.max(0, origBuf.length - result.buffer.length);
       serverStats.requestsSuccess++;
@@ -1099,7 +1094,7 @@ export async function handleRequest(req, res) {
     return;
   }
 
-  // Turbo-CBZ chapter bundler endpoint
+  // Streaming Turbo-CBZ chapter bundler endpoint (O(1) RAM per page for 512MB Render Free)
   if (req.method === 'POST' && path === '/chapter-bundle') {
     serverStats.requestsTotal++;
     try {
@@ -1112,91 +1107,101 @@ export async function handleRequest(req, res) {
       const digitCount = Math.max(3, String(pages.length).length);
       let origTotal = 0;
       let compTotal = 0;
+      let succeededPages = 0;
+      let filesPacked = 0;
       const failedPages = [];
-      const filesToPack = [];
-
-      const processed = await runWithConcurrency(pages, 4, async (p) => {
-        const idx = Number(p.index);
-        if (!Number.isInteger(idx) || idx < 0 || !p.url) {
-          return { ok: false, index: p.index, url: p.url, error: 'Invalid page descriptor' };
-        }
-        const prefix = String(idx).padStart(digitCount, '0');
-        try {
-          const { buffer: origBuf, magic } = await safeFetchImageBuffer(p.url, {
-            referer: p.referer,
-            userAgent: p.userAgent,
-          });
-          const slices = await compressAndSliceForBundle(origBuf, magic, prefix, body);
-          const sliceBytes = slices.reduce((sum, s) => sum + s.buffer.length, 0);
-          return { ok: true, index: idx, origBytes: origBuf.length, compBytes: sliceBytes, slices };
-        } catch (err) {
-          return { ok: false, index: idx, url: p.url, error: err.message || 'Fetch failed' };
-        }
-      });
-
-      for (const item of processed) {
-        if (item.ok) {
-          origTotal += item.origBytes;
-          compTotal += item.compBytes;
-          filesToPack.push(...item.slices);
-        } else {
-          failedPages.push({ index: item.index, url: item.url, error: item.error });
-        }
-      }
-
-      if (filesToPack.length === 0) {
-        throw new HttpError(502, 'All pages in chapter bundle failed upstream');
-      }
-
-      serverStats.requestsSuccess++;
-      serverStats.bytesOriginalTotal += origTotal;
-      serverStats.bytesCompressedTotal += compTotal;
-
-      // Build ZIP STORE (.cbz) in memory so we can send accurate Content-Length & telemetry headers
-      const zipBuffer = await new Promise((resolve, reject) => {
-        const chunks = [];
-        const archive = archiver('zip', { store: true });
-        archive.on('data', (chunk) => chunks.push(chunk));
-        archive.on('end', () => resolve(Buffer.concat(chunks)));
-        archive.on('error', reject);
-
-        for (const f of filesToPack) {
-          archive.append(f.buffer, { name: f.filename });
-        }
-        archive.append(
-          JSON.stringify({
-            originalBytes: origTotal,
-            compressedBytes: compTotal,
-            savedBytes: Math.max(0, origTotal - compTotal),
-            succeededCount: filesToPack.length,
-            failedPages,
-          }),
-          { name: '_bundle_meta.json' },
-        );
-        archive.finalize();
-      });
-
-      if (process.env.VERCEL && zipBuffer.length > 4_200_000) {
-        res.writeHead(413, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Bundle exceeds serverless 4.2MB limit; use per-page fallback' }));
-        return;
-      }
+      let clientAborted = false;
+      const onClose = () => {
+        if (!res.writableEnded) clientAborted = true;
+      };
+      if (typeof res.on === 'function') res.on('close', onClose);
 
       res.writeHead(200, {
         'Content-Type': 'application/zip',
-        'Content-Length': zipBuffer.length,
-        'X-Original-Size': String(origTotal),
-        'X-Compressed-Size': String(compTotal),
-        'X-Saved-Bytes': String(Math.max(0, origTotal - compTotal)),
-        'X-Pages-Succeeded': String(processed.filter((x) => x.ok).length),
-        'X-Pages-Failed': String(failedPages.length),
+        'X-Bundle-Mode': 'streaming-v2',
       });
-      res.end(zipBuffer);
+
+      const archive = archiver('zip', { store: true });
+      archive.pipe(res);
+      const archiveDone = new Promise((resolve, reject) => {
+        if (typeof res.on === 'function') {
+          res.on('finish', resolve);
+          res.on('close', resolve);
+        } else {
+          archive.on('end', resolve);
+        }
+        archive.on('error', reject);
+      });
+
+      try {
+        // Process at most 2 pages concurrently and stream each page's slices immediately into ZIP
+        await runWithConcurrency(pages, 2, async (p) => {
+          if (clientAborted) return;
+          const idx = Number(p.index);
+          if (!Number.isInteger(idx) || idx < 0 || !p.url) {
+            failedPages.push({ index: p.index, url: p.url, error: 'Invalid page descriptor' });
+            return;
+          }
+          const prefix = String(idx).padStart(digitCount, '0');
+          try {
+            const { buffer: origBuf, magic } = await safeFetchImageBuffer(p.url, {
+              referer: p.referer,
+              userAgent: p.userAgent,
+            });
+            if (clientAborted) return;
+            const slices = await withSharpSlot(() => compressAndSliceForBundle(origBuf, magic, prefix, body));
+            if (clientAborted) return;
+            let sliceBytes = 0;
+            for (const s of slices) {
+              sliceBytes += s.buffer.length;
+              archive.append(s.buffer, { name: s.filename });
+              filesPacked++;
+            }
+            origTotal += origBuf.length;
+            compTotal += sliceBytes;
+            succeededPages++;
+          } catch (err) {
+            failedPages.push({ index: idx, url: p.url, error: err.message || 'Fetch failed' });
+          }
+        });
+
+        if (!clientAborted) {
+          archive.append(
+            JSON.stringify({
+              originalBytes: origTotal,
+              compressedBytes: compTotal,
+              savedBytes: Math.max(0, origTotal - compTotal),
+              succeededPages,
+              succeededCount: filesPacked,
+              failedPages,
+            }),
+            { name: '_bundle_meta.json' },
+          );
+          await archive.finalize();
+          await archiveDone;
+        } else {
+          archive.abort();
+        }
+      } finally {
+        if (typeof res.off === 'function') res.off('close', onClose);
+      }
+
+      if (succeededPages > 0) {
+        serverStats.requestsSuccess++;
+        serverStats.bytesOriginalTotal += origTotal;
+        serverStats.bytesCompressedTotal += compTotal;
+      } else {
+        serverStats.requestsFailed++;
+      }
     } catch (err) {
       serverStats.requestsFailed++;
-      const status = err instanceof HttpError ? err.status : 502;
-      res.writeHead(status, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: err.message || 'Chapter bundle failed' }));
+      if (!res.headersSent) {
+        const status = err instanceof HttpError ? err.status : 502;
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: err.message || 'Chapter bundle failed' }));
+      } else if (!res.writableEnded) {
+        res.end();
+      }
     }
     return;
   }

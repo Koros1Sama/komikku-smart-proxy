@@ -6,12 +6,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY package.json ./
-RUN npm install --omit=dev
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
 
 COPY server.js pipeline.js ./
 
-# Hugging Face Spaces expects port 7860 by default; Koyeb/Render override PORT
+# Constrain glibc memory arenas on 512MB Render Free containers
+ENV MALLOC_ARENA_MAX=2
 ENV PORT=7860
 ENV NODE_ENV=production
 
