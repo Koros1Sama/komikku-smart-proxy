@@ -1,5 +1,6 @@
 import http from 'node:http';
 import https from 'node:https';
+import crypto from 'node:crypto';
 import dns from 'node:dns';
 import net from 'node:net';
 import zlib from 'node:zlib';
@@ -20,6 +21,13 @@ const inflateAsync = promisify(zlib.inflate);
 
 const PORT = Number(process.env.PORT || 7860);
 const PROXY_KEY = (process.env.PROXY_KEY || '').trim();
+const KOROTOMI_RELEASE_REPO = (process.env.KOROTOMI_RELEASE_REPO || 'Koros1Sama/korotomi').trim();
+const KOROTOMI_RELEASE_GH_TOKEN = (process.env.KOROTOMI_RELEASE_GH_TOKEN || '').trim();
+const KOROTOMI_UPDATE_KEY = (
+  process.env.KOROTOMI_UPDATE_KEY || 'krtm_upd_9f4b2a7e8c1d5036e9a4f2c7b8103d5e'
+).trim();
+const RELEASE_CACHE_TTL_MS = 5 * 60 * 1000;
+let releaseCacheEntry = { data: null, expiresAt: 0 };
 const MAX_DOWNLOAD_BYTES = Number(process.env.MAX_DOWNLOAD_BYTES || 35 * 1024 * 1024); // 35 MB cap
 const MAX_FETCH_BYTES = Number(process.env.MAX_FETCH_BYTES || 15 * 1024 * 1024); // 15 MB cap for HTML/JSON bridge
 const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 15000);
@@ -854,9 +862,260 @@ async function runWithConcurrency(items, limit, worker) {
   return results;
 }
 
+function timingSafeEqualStr(a, b) {
+  if (!a || !b) return false;
+  const bufA = Buffer.from(String(a), 'utf8');
+  const bufB = Buffer.from(String(b), 'utf8');
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
+export function checkKorotomiUpdateAuth(req, parsedUrl) {
+  const supplied = (
+    req.headers['x-korotomi-update-key'] ||
+    parsedUrl.searchParams.get('k') ||
+    ''
+  )
+    .toString()
+    .trim();
+  return timingSafeEqualStr(supplied, KOROTOMI_UPDATE_KEY);
+}
+
+export function sanitizeKorotomiReleases(rawReleases, publicOrigin, updateKey) {
+  if (!Array.isArray(rawReleases)) return [];
+  const encodedKey = encodeURIComponent(updateKey);
+  return rawReleases
+    .filter((rel) => rel && !rel.draft && typeof rel.tag_name === 'string')
+    .map((rel) => {
+      const apkAssets = (Array.isArray(rel.assets) ? rel.assets : [])
+        .filter((a) => a && typeof a.name === 'string' && a.name.toLowerCase().endsWith('.apk') && Number.isInteger(a.id))
+        .map((a) => ({
+          name: a.name,
+          browser_download_url: `${publicOrigin}/korotomi-update/asset/${a.id}?k=${encodedKey}`,
+        }));
+      return {
+        tag_name: rel.tag_name,
+        body: typeof rel.body === 'string' ? rel.body : '',
+        html_url: 'https://t.me/korossama',
+        prerelease: Boolean(rel.prerelease),
+        draft: false,
+        assets: apkAssets,
+      };
+    })
+    .filter((rel) => rel.assets.length > 0);
+}
+
+function fetchGithubApiJson(apiPath) {
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      {
+        hostname: 'api.github.com',
+        path: apiPath,
+        method: 'GET',
+        agent: httpsKeepAliveAgent,
+        timeout: FETCH_TIMEOUT_MS,
+        headers: {
+          Authorization: `Bearer ${KOROTOMI_RELEASE_GH_TOKEN}`,
+          Accept: 'application/vnd.github+json',
+          'X-GitHub-Api-Version': '2022-11-28',
+          'User-Agent': 'Korotomi-Update-Gateway/1.0',
+        },
+      },
+      (res) => {
+        const chunks = [];
+        let len = 0;
+        res.on('data', (c) => {
+          len += c.length;
+          if (len > 4 * 1024 * 1024) {
+            res.destroy();
+            return reject(new HttpError(502, 'GitHub releases payload too large'));
+          }
+          chunks.push(c);
+        });
+        res.on('end', () => {
+          const text = Buffer.concat(chunks).toString('utf8');
+          if ((res.statusCode || 500) >= 400) {
+            return reject(new HttpError(res.statusCode === 404 ? 404 : 502, `GitHub API HTTP ${res.statusCode}`));
+          }
+          try {
+            resolve(JSON.parse(text));
+          } catch {
+            reject(new HttpError(502, 'Invalid JSON from GitHub API'));
+          }
+        });
+        res.on('error', (err) => reject(new HttpError(502, err.message)));
+      },
+    );
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new HttpError(504, 'GitHub API timed out'));
+    });
+    req.on('error', (err) => reject(new HttpError(502, err.message)));
+    req.end();
+  });
+}
+
+function resolvePrivateAssetSignedUrl(assetId) {
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      {
+        hostname: 'api.github.com',
+        path: `/repos/${KOROTOMI_RELEASE_REPO}/releases/assets/${assetId}`,
+        method: 'GET',
+        agent: httpsKeepAliveAgent,
+        timeout: FETCH_TIMEOUT_MS,
+        headers: {
+          Authorization: `Bearer ${KOROTOMI_RELEASE_GH_TOKEN}`,
+          Accept: 'application/octet-stream',
+          'X-GitHub-Api-Version': '2022-11-28',
+          'User-Agent': 'Korotomi-Update-Gateway/1.0',
+        },
+      },
+      (res) => {
+        res.resume();
+        const status = res.statusCode || 500;
+        if (status >= 300 && status < 400 && res.headers.location) {
+          return resolve(res.headers.location);
+        }
+        return reject(new HttpError(status === 404 ? 404 : 502, `Asset lookup failed (HTTP ${status})`));
+      },
+    );
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new HttpError(504, 'GitHub asset lookup timed out'));
+    });
+    req.on('error', (err) => reject(new HttpError(502, err.message)));
+    req.end();
+  });
+}
+
+async function handleKorotomiUpdateRequest(req, res, parsedUrl, path) {
+  if (!checkKorotomiUpdateAuth(req, parsedUrl)) {
+    res.writeHead(401, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Unauthorized update client' }));
+    return;
+  }
+  if (!KOROTOMI_RELEASE_GH_TOKEN) {
+    res.writeHead(503, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Update gateway token not configured on server' }));
+    return;
+  }
+
+  const proto = (req.headers['x-forwarded-proto'] || 'https').toString().split(',')[0].trim();
+  const host = (req.headers['x-forwarded-host'] || req.headers.host || 'komikku-smart-proxy.onrender.com')
+    .toString()
+    .split(',')[0]
+    .trim();
+  const publicOrigin = `${proto}://${host}`;
+  const suppliedKey = (req.headers['x-korotomi-update-key'] || parsedUrl.searchParams.get('k') || '')
+    .toString()
+    .trim();
+
+  if (path === '/korotomi-update/releases' || path === '/korotomi-update/latest') {
+    try {
+      const forceRefresh = parsedUrl.searchParams.get('refresh') === '1';
+      let rawReleases = !forceRefresh && releaseCacheEntry.data && Date.now() < releaseCacheEntry.expiresAt
+        ? releaseCacheEntry.data
+        : null;
+      if (!rawReleases) {
+        rawReleases = await fetchGithubApiJson(`/repos/${KOROTOMI_RELEASE_REPO}/releases?per_page=10`);
+        releaseCacheEntry = { data: rawReleases, expiresAt: Date.now() + RELEASE_CACHE_TTL_MS };
+      }
+      const releases = sanitizeKorotomiReleases(rawReleases, publicOrigin, suppliedKey);
+      if (path === '/korotomi-update/latest') {
+        const latest = releases.find((r) => !r.prerelease) || releases[0];
+        if (!latest) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'No release available' }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'private, max-age=120' });
+        res.end(JSON.stringify(latest));
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'private, max-age=120' });
+      res.end(JSON.stringify(releases));
+    } catch (err) {
+      const status = err instanceof HttpError ? err.status : 502;
+      res.writeHead(status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message || 'Release check failed' }));
+    }
+    return;
+  }
+
+  const assetMatch = /^\/korotomi-update\/asset\/(\d+)$/.exec(path);
+  if (assetMatch) {
+    try {
+      const signedUrl = await resolvePrivateAssetSignedUrl(assetMatch[1]);
+      const cdnParsed = new URL(signedUrl);
+      const upstreamHeaders = { 'User-Agent': 'Korotomi-Update-Gateway/1.0' };
+      if (req.headers.range) {
+        upstreamHeaders.Range = req.headers.range;
+      }
+
+      await new Promise((resolve, reject) => {
+        const cdnReq = https.request(
+          {
+            hostname: cdnParsed.hostname,
+            port: cdnParsed.port || 443,
+            path: `${cdnParsed.pathname}${cdnParsed.search}`,
+            method: 'GET',
+            timeout: 30_000,
+            headers: upstreamHeaders,
+          },
+          (cdnRes) => {
+            const outHeaders = {
+              'Content-Type': cdnRes.headers['content-type'] || 'application/vnd.android.package-archive',
+              'Cache-Control': 'private, no-store',
+            };
+            if (cdnRes.headers['content-length']) outHeaders['Content-Length'] = cdnRes.headers['content-length'];
+            if (cdnRes.headers['content-range']) outHeaders['Content-Range'] = cdnRes.headers['content-range'];
+            if (cdnRes.headers['accept-ranges']) outHeaders['Accept-Ranges'] = cdnRes.headers['accept-ranges'];
+            if (cdnRes.headers['content-disposition']) {
+              outHeaders['Content-Disposition'] = cdnRes.headers['content-disposition'];
+            }
+            res.writeHead(cdnRes.statusCode || 200, outHeaders);
+            cdnRes.pipe(res);
+            cdnRes.on('end', resolve);
+            cdnRes.on('error', reject);
+          },
+        );
+        const onClientClose = () => {
+          if (!res.writableEnded) cdnReq.destroy();
+          resolve();
+        };
+        if (typeof res.on === 'function') res.on('close', onClientClose);
+        cdnReq.on('timeout', () => {
+          cdnReq.destroy();
+          reject(new HttpError(504, 'APK stream timed out'));
+        });
+        cdnReq.on('error', (err) => reject(new HttpError(502, err.message)));
+        cdnReq.end();
+      });
+    } catch (err) {
+      if (!res.headersSent) {
+        const status = err instanceof HttpError ? err.status : 502;
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: err.message || 'APK download failed' }));
+      } else if (!res.writableEnded) {
+        res.end();
+      }
+    }
+    return;
+  }
+
+  res.writeHead(404, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ error: 'Not found' }));
+}
+
 export async function handleRequest(req, res) {
   const parsedUrl = new URL(req.url || '/', `http://localhost:${PORT}`);
   const path = parsedUrl.pathname;
+
+  if (req.method === 'GET' && path.startsWith('/korotomi-update/')) {
+    await handleKorotomiUpdateRequest(req, res, parsedUrl, path);
+    return;
+  }
 
   if (req.method === 'GET' && path === '/health') {
     const wantsAuthVerify =

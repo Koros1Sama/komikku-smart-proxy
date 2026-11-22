@@ -11,6 +11,7 @@ import {
   parseForwardedHeaders,
   createPinnedLookup,
   stripSensitiveCrossOriginHeaders,
+  sanitizeKorotomiReleases,
   ByteLruCache,
   PerOriginPoliteLimiter,
   extractPaginatedNextUrls,
@@ -396,5 +397,50 @@ describe('Tier 0 Hardening: Node 20+ Pinned Lookup, Cross-Origin Redirects, Stre
     const zipAscii = ssrfBundle.raw.toString('utf8');
     assert.ok(zipAscii.includes('_bundle_meta.json'));
     assert.ok(zipAscii.includes('"succeededPages":0'));
+  });
+
+  it('protects /korotomi-update/* with dedicated app key and rewrites private assets without leaking repo URL', async () => {
+    const req = Readable.from([]);
+    req.method = 'GET';
+    req.url = '/korotomi-update/releases';
+    req.headers = {};
+    let statusCode = 0;
+    const chunks = [];
+    const res = {
+      writeHead(code) {
+        statusCode = code;
+      },
+      end(buf) {
+        if (buf) chunks.push(Buffer.isBuffer(buf) ? buf : Buffer.from(String(buf)));
+      },
+    };
+    await handleRequest(req, res);
+    assert.equal(statusCode, 401);
+
+    const sanitized = sanitizeKorotomiReleases(
+      [
+        {
+          tag_name: 'v1.14.2',
+          body: 'Tier 1 fixes',
+          html_url: 'https://github.com/Koros1Sama/korotomi/releases/tag/v1.14.2',
+          prerelease: false,
+          draft: false,
+          assets: [
+            { id: 12345, name: 'Korotomi-arm64-v8a-v1.14.2.apk', browser_download_url: 'https://private.example/a' },
+            { id: 99999, name: 'checksums.txt', browser_download_url: 'https://private.example/b' },
+          ],
+        },
+        { tag_name: 'v1.14.3-draft', draft: true, assets: [{ id: 1, name: 'x.apk' }] },
+      ],
+      'https://komikku-smart-proxy.onrender.com',
+      'secret_key',
+    );
+    assert.equal(sanitized.length, 1);
+    assert.equal(sanitized[0].html_url, 'https://t.me/korossama');
+    assert.equal(sanitized[0].assets.length, 1);
+    assert.equal(
+      sanitized[0].assets[0].browser_download_url,
+      'https://komikku-smart-proxy.onrender.com/korotomi-update/asset/12345?k=secret_key',
+    );
   });
 });
