@@ -474,6 +474,33 @@ export function detectImageMagic(buf) {
   return null;
 }
 
+export function validateUpstreamResponseCompleteness(complete, contentLengthHeader, actualBytes, method = 'GET') {
+  if (!complete) {
+    return 'Upstream response stream terminated prematurely';
+  }
+  const expectedLen = Number(contentLengthHeader || 0);
+  if (String(method || 'GET').toUpperCase() !== 'HEAD' && expectedLen > 0 && actualBytes !== expectedLen) {
+    return `Upstream response truncated (${actualBytes}/${expectedLen})`;
+  }
+  return null;
+}
+
+export function computeBundleDigitCount(pages, totalPagesHint = 0) {
+  const list = Array.isArray(pages) ? pages : [];
+  let maxVal = list.length;
+  for (const p of list) {
+    const idx = Number(p?.index);
+    if (Number.isInteger(idx) && idx > maxVal) {
+      maxVal = idx;
+    }
+  }
+  const hint = Number(totalPagesHint);
+  if (Number.isInteger(hint) && hint > maxVal) {
+    maxVal = hint;
+  }
+  return Math.max(3, String(maxVal).length);
+}
+
 /**
  * Performs an SSRF-safe HTTP(S) GET with pinned DNS IP and manual redirect validation.
  */
@@ -507,6 +534,20 @@ async function safeFetchImageBuffer(targetUrl, { referer, userAgent } = {}) {
 
     // Release originLimiter slot BEFORE following any redirect (prevents same-host deadlock!)
     const hop = await originLimiter.run(parsed.hostname, () => new Promise((resolve, reject) => {
+      let settled = false;
+      const doneResolve = (val) => {
+        if (!settled) {
+          settled = true;
+          resolve(val);
+        }
+      };
+      const doneReject = (err) => {
+        if (!settled) {
+          settled = true;
+          reject(err);
+        }
+      };
+
       const options = {
         hostname: parsed.hostname,
         port: parsed.port || (isHttps ? 443 : 80),
@@ -527,22 +568,22 @@ async function safeFetchImageBuffer(targetUrl, { referer, userAgent } = {}) {
           try {
             nextUrl = new URL(res.headers.location, parsed).toString();
           } catch {
-            return reject(new HttpError(502, 'Invalid redirect location'));
+            return doneReject(new HttpError(502, 'Invalid redirect location'));
           }
           const sameOrigin = new URL(nextUrl).origin === parsed.origin;
-          return resolve({ redirectTo: nextUrl, sameOrigin });
+          return doneResolve({ redirectTo: nextUrl, sameOrigin });
         }
 
         if (status < 200 || status >= 300) {
           res.resume();
           if (status === 429) serverStats.rateLimit429Count++;
-          return reject(new HttpError(status === 403 || status === 429 ? status : 502, `Upstream returned HTTP ${status}`));
+          return doneReject(new HttpError(status === 403 || status === 429 ? status : 502, `Upstream returned HTTP ${status}`));
         }
 
         const contentLen = Number(res.headers['content-length'] || 0);
         if (contentLen > MAX_DOWNLOAD_BYTES) {
           res.destroy();
-          return reject(new HttpError(413, 'Upstream image exceeds max size cap'));
+          return doneReject(new HttpError(413, 'Upstream image exceeds max size cap'));
         }
 
         const chunks = [];
@@ -552,28 +593,41 @@ async function safeFetchImageBuffer(targetUrl, { referer, userAgent } = {}) {
           totalBytes += chunk.length;
           if (totalBytes > MAX_DOWNLOAD_BYTES) {
             res.destroy();
-            return reject(new HttpError(413, 'Upstream image exceeded max download size'));
+            return doneReject(new HttpError(413, 'Upstream image exceeded max download size'));
           }
           chunks.push(chunk);
         });
 
-        res.on('end', () => {
-          const buffer = Buffer.concat(chunks);
-          const magic = detectImageMagic(buffer);
-          if (!magic) {
-            return reject(new HttpError(502, 'Upstream response is not a valid raster image (possible HTML/CF challenge)'));
-          }
-          resolve({ buffer, magic, upstreamStatus: status });
+        res.on('aborted', () => {
+          doneReject(new HttpError(502, 'Upstream image response aborted'));
         });
 
-        res.on('error', (err) => reject(new HttpError(502, err.message)));
+        res.on('end', () => {
+          const buffer = Buffer.concat(chunks);
+          const completenessErr = validateUpstreamResponseCompleteness(
+            res.complete,
+            res.headers['content-length'],
+            buffer.length,
+            'GET',
+          );
+          if (completenessErr) {
+            return doneReject(new HttpError(502, completenessErr));
+          }
+          const magic = detectImageMagic(buffer);
+          if (!magic) {
+            return doneReject(new HttpError(502, 'Upstream response is not a valid raster image (possible HTML/CF challenge)'));
+          }
+          doneResolve({ buffer, magic, upstreamStatus: status });
+        });
+
+        res.on('error', (err) => doneReject(new HttpError(502, err.message)));
       });
 
       req.on('timeout', () => {
         req.destroy();
-        reject(new HttpError(504, 'Upstream fetch timed out'));
+        doneReject(new HttpError(504, 'Upstream fetch timed out'));
       });
-      req.on('error', (err) => reject(new HttpError(502, err.message)));
+      req.on('error', (err) => doneReject(new HttpError(502, err.message)));
       req.end();
     }));
 
@@ -776,11 +830,25 @@ async function safeFetchUpstreamBridge(
           chunks.push(chunk);
         });
 
+        res.on('aborted', () => {
+          reject(new HttpError(502, 'Upstream bridge response aborted'));
+        });
+
         res.on('end', () => {
+          const rawBody = Buffer.concat(chunks);
+          const completenessErr = validateUpstreamResponseCompleteness(
+            res.complete,
+            res.headers['content-length'],
+            rawBody.length,
+            currentMethod,
+          );
+          if (completenessErr) {
+            return reject(new HttpError(502, completenessErr));
+          }
           resolve({
             status,
             contentType: res.headers['content-type'] || 'text/html; charset=utf-8',
-            rawBody: Buffer.concat(chunks),
+            rawBody,
             contentEncoding: res.headers['content-encoding'],
             finalUrl: parsed.toString(),
             setCookies: collectedCookies,
@@ -1363,39 +1431,46 @@ export async function handleRequest(req, res) {
         throw new HttpError(400, 'pages array must contain between 1 and 300 entries');
       }
 
-      const digitCount = Math.max(3, String(pages.length).length);
+      const digitCount = computeBundleDigitCount(pages, body?.totalPages);
       let origTotal = 0;
       let compTotal = 0;
       let succeededPages = 0;
       let filesPacked = 0;
+      const pageSlices = {};
       const failedPages = [];
+      let blockedFailures = 0;
+      let earlyAbortBlocked = false;
       let clientAborted = false;
       const onClose = () => {
         if (!res.writableEnded) clientAborted = true;
       };
       if (typeof res.on === 'function') res.on('close', onClose);
 
-      res.writeHead(200, {
-        'Content-Type': 'application/zip',
-        'X-Bundle-Mode': 'streaming-v2',
-      });
-
-      const archive = archiver('zip', { store: true });
-      archive.pipe(res);
-      const archiveDone = new Promise((resolve, reject) => {
-        if (typeof res.on === 'function') {
-          res.on('finish', resolve);
-          res.on('close', resolve);
-        } else {
-          archive.on('end', resolve);
-        }
-        archive.on('error', reject);
-      });
+      let archive = null;
+      let archiveDone = null;
+      const ensureArchiveStarted = () => {
+        if (archive) return;
+        res.writeHead(200, {
+          'Content-Type': 'application/zip',
+          'X-Bundle-Mode': 'streaming-v2',
+        });
+        archive = archiver('zip', { store: true });
+        archive.pipe(res);
+        archiveDone = new Promise((resolve, reject) => {
+          if (typeof res.on === 'function') {
+            res.on('finish', resolve);
+            res.on('close', resolve);
+          } else {
+            archive.on('end', resolve);
+          }
+          archive.on('error', reject);
+        });
+      };
 
       try {
         // Process at most 2 pages concurrently and stream each page's slices immediately into ZIP
         await runWithConcurrency(pages, 2, async (p) => {
-          if (clientAborted) return;
+          if (clientAborted || earlyAbortBlocked) return;
           const idx = Number(p.index);
           if (!Number.isInteger(idx) || idx < 0 || !p.url) {
             failedPages.push({ index: p.index, url: p.url, error: 'Invalid page descriptor' });
@@ -1410,21 +1485,52 @@ export async function handleRequest(req, res) {
             if (clientAborted) return;
             const slices = await withSharpSlot(() => compressAndSliceForBundle(origBuf, magic, prefix, body));
             if (clientAborted) return;
+            if (!Array.isArray(slices) || slices.length === 0) {
+              failedPages.push({ index: idx, url: p.url, error: 'Empty compressed slice output' });
+              return;
+            }
+            ensureArchiveStarted();
             let sliceBytes = 0;
             for (const s of slices) {
               sliceBytes += s.buffer.length;
               archive.append(s.buffer, { name: s.filename });
               filesPacked++;
             }
+            pageSlices[prefix] = slices.length;
             origTotal += origBuf.length;
             compTotal += sliceBytes;
             succeededPages++;
           } catch (err) {
+            const status = err instanceof HttpError ? err.status : 0;
+            if (status === 403 || status === 429) {
+              blockedFailures++;
+            }
             failedPages.push({ index: idx, url: p.url, error: err.message || 'Fetch failed' });
+            if (succeededPages === 0 && blockedFailures >= 6 && failedPages.length === blockedFailures) {
+              earlyAbortBlocked = true;
+            }
           }
         });
 
-        if (!clientAborted) {
+        if (clientAborted) {
+          if (archive) archive.abort();
+        } else if (succeededPages === 0 || !archive) {
+          // Never return HTTP 200 when zero pages succeeded so the client trips cooldown immediately
+          serverStats.requestsFailed++;
+          if (!res.headersSent) {
+            res.writeHead(502, { 'Content-Type': 'application/json' });
+            res.end(
+              JSON.stringify({
+                error: 'All chapter pages failed to fetch',
+                succeededPages: 0,
+                failedPages,
+              }),
+            );
+          } else if (!res.writableEnded) {
+            res.end();
+          }
+          return;
+        } else {
           archive.append(
             JSON.stringify({
               originalBytes: origTotal,
@@ -1432,14 +1538,13 @@ export async function handleRequest(req, res) {
               savedBytes: Math.max(0, origTotal - compTotal),
               succeededPages,
               succeededCount: filesPacked,
+              pageSlices,
               failedPages,
             }),
             { name: '_bundle_meta.json' },
           );
           await archive.finalize();
           await archiveDone;
-        } else {
-          archive.abort();
         }
       } finally {
         if (typeof res.off === 'function') res.off('close', onClose);

@@ -16,6 +16,8 @@ import {
   PerOriginPoliteLimiter,
   extractPaginatedNextUrls,
   handleRequest,
+  validateUpstreamResponseCompleteness,
+  computeBundleDigitCount,
 } from './server.js';
 import {
   analyzePageContent,
@@ -382,21 +384,35 @@ describe('Tier 0 Hardening: Node 20+ Pinned Lookup, Cross-Origin Redirects, Stre
     const emptyBundle = await invoke('/chapter-bundle', { pages: [] });
     assert.equal(emptyBundle.statusCode, 400);
 
-    // SSRF pages should stream a valid ZIP (PK\x03\x04) containing _bundle_meta.json with failedPages
+    // When ALL pages fail (e.g. SSRF blocked or origin blocking Render), must return HTTP 502 JSON (never HTTP 200)
     const ssrfBundle = await invoke('/chapter-bundle', {
       pages: [
         { index: 0, url: 'http://127.0.0.1/secret.png' },
         { index: 1, url: 'http://169.254.169.254/latest/meta-data/' },
       ],
     });
-    assert.equal(ssrfBundle.statusCode, 200);
-    assert.equal(ssrfBundle.headers['X-Bundle-Mode'], 'streaming-v2');
-    // ZIP magic bytes PK\x03\x04
-    assert.equal(ssrfBundle.raw[0], 0x50);
-    assert.equal(ssrfBundle.raw[1], 0x4b);
-    const zipAscii = ssrfBundle.raw.toString('utf8');
-    assert.ok(zipAscii.includes('_bundle_meta.json'));
-    assert.ok(zipAscii.includes('"succeededPages":0'));
+    assert.equal(ssrfBundle.statusCode, 502);
+    const ssrfJson = JSON.parse(ssrfBundle.raw.toString('utf8'));
+    assert.equal(ssrfJson.succeededPages, 0);
+    assert.equal(ssrfJson.failedPages.length, 2);
+  });
+
+  it('validates upstream response completeness (res.complete & Content-Length) and bundle digitCount', () => {
+    // Premature termination (res.complete === false) must be rejected
+    assert.ok(validateUpstreamResponseCompleteness(false, '1024', 1024, 'GET'));
+    // Truncated body vs Content-Length must be rejected on GET
+    assert.ok(validateUpstreamResponseCompleteness(true, '2048', 1024, 'GET'));
+    // Exact match passes
+    assert.equal(validateUpstreamResponseCompleteness(true, '2048', 2048, 'GET'), null);
+    // Chunked response without Content-Length passes when res.complete === true
+    assert.equal(validateUpstreamResponseCompleteness(true, undefined, 512, 'GET'), null);
+    // HEAD request with Content-Length > 0 and 0 body bytes passes
+    assert.equal(validateUpstreamResponseCompleteness(true, '2048', 0, 'HEAD'), null);
+
+    // digitCount respects totalPages hint even when only a subset of missing pages is sent
+    assert.equal(computeBundleDigitCount([{ index: 1 }, { index: 2 }], 0), 3);
+    assert.equal(computeBundleDigitCount([{ index: 5 }, { index: 12 }], 1250), 4);
+    assert.equal(computeBundleDigitCount([{ index: 999 }, { index: 1005 }], 0), 4);
   });
 
   it('protects /korotomi-update/* with dedicated app key and rewrites private assets without leaking repo URL', async () => {
