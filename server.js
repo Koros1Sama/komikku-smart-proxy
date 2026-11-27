@@ -21,7 +21,10 @@ const inflateAsync = promisify(zlib.inflate);
 
 const PORT = Number(process.env.PORT || 7860);
 const PROXY_KEY = (process.env.PROXY_KEY || '').trim();
-const KOROTOMI_RELEASE_REPO = (process.env.KOROTOMI_RELEASE_REPO || 'Koros1Sama/korotomi').trim();
+const KOROTOMI_RELEASE_REPO = (process.env.KOROTOMI_RELEASE_REPO || 'Koros1Sama/korotomi-releases').trim();
+const KOROTOMI_RELEASES_PUBLIC_WEB = (
+  process.env.KOROTOMI_RELEASES_PUBLIC_WEB || 'https://github.com/Koros1Sama/korotomi-releases'
+).trim().replace(/\/+$/, '');
 const KOROTOMI_RELEASE_GH_TOKEN = (process.env.KOROTOMI_RELEASE_GH_TOKEN || '').trim();
 const KOROTOMI_UPDATE_KEY = (
   process.env.KOROTOMI_UPDATE_KEY || 'krtm_upd_9f4b2a7e8c1d5036e9a4f2c7b8103d5e'
@@ -964,7 +967,7 @@ export function sanitizeKorotomiReleases(rawReleases, publicOrigin, updateKey) {
       return {
         tag_name: rel.tag_name,
         body: typeof rel.body === 'string' ? rel.body : '',
-        html_url: 'https://t.me/korossama',
+        html_url: `${KOROTOMI_RELEASES_PUBLIC_WEB}/releases/tag/${encodeURIComponent(rel.tag_name)}`,
         prerelease: Boolean(rel.prerelease),
         draft: false,
         assets: apkAssets,

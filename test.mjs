@@ -452,7 +452,7 @@ describe('Tier 0 Hardening: Node 20+ Pinned Lookup, Cross-Origin Redirects, Stre
       'secret_key',
     );
     assert.equal(sanitized.length, 1);
-    assert.equal(sanitized[0].html_url, 'https://t.me/korossama');
+    assert.equal(sanitized[0].html_url, 'https://github.com/Koros1Sama/korotomi-releases/releases/tag/v1.14.2');
     assert.equal(sanitized[0].assets.length, 1);
     assert.equal(
       sanitized[0].assets[0].browser_download_url,
